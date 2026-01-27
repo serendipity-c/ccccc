@@ -1,15 +1,13 @@
-# Scheduled workflow to run the email_system script at China time:
-#  - 09:00 Asia/Shanghai -> morning_brief
-#  - 12:00 Asia/Shanghai -> midday_review
-#  - 16:30 Asia/Shanghai -> eod_summary
+# 调度与手动触发的工作流：在 Asia/Shanghai 时间点发送报告（09:00、12:00、16:30）
+# 使用 DR-lin-eng/stock-scanner 服务（通过 DR_STOCK_SCANNER_URL 环境变量 / Secret）
 #
-# Includes manual dispatch (workflow_dispatch) to test:
-#  - You can optionally pass `report_type` (morning_brief | midday_review | eod_summary)
-#    and `stock_scanner_url` to override the configured URL for a single test run.
+# 支持：
+#  - 定时触发（三个 cron）
+#  - 手动触发（workflow_dispatch），可通过 inputs 指定 report_type 和 dr_stock_scanner_url 覆盖 secret（仅本次运行）
 #
-# Notes:
-#  - Configure STOCK_SCANNER_URL as a repository secret for normal runs.
-#  - If you trigger manually, you may supply a `stock_scanner_url` input to override the secret.
+# 使用说明：
+#  - 请在仓库 Secrets 中添加 DR_STOCK_SCANNER_URL（值示例：http://your-host:8443）
+#  - 推荐把 SUPABASE_SERVICE_KEY、RESEND_API_KEY、SMTP 凭据等也设为 Secrets 并在脚本中从 env 读取。
 on:
   schedule:
     - cron: '0 1 * * *'    # 09:00 Asia/Shanghai
@@ -18,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       report_type:
-        description: 'Optional. One of: morning_brief, midday_review, eod_summary. If empty, schedule time decides.'
+        description: '（可选）指定报告类型：morning_brief | midday_review | eod_summary。若不填写则依调度时间决定。'
         required: false
         default: ''
         type: choice
@@ -26,12 +24,12 @@ on:
           - morning_brief
           - midday_review
           - eod_summary
-      stock_scanner_url:
-        description: 'Optional. Override STOCK_SCANNER_URL for this run (e.g. http://localhost:8000).'
+      dr_stock_scanner_url:
+        description: '（可选）本次运行覆盖 DR_STOCK_SCANNER_URL（例如 http://localhost:8443）'
         required: false
         default: ''
 
-name: Send Stock Reports
+name: Send Stock Reports (DR stock-scanner)
 
 permissions:
   contents: read
@@ -40,10 +38,14 @@ jobs:
   send_reports:
     runs-on: ubuntu-latest
     env:
-      # Expose the repository secret here; may be empty if you haven't set it.
-      SECRET_STOCK_SCANNER_URL: ${{ secrets.STOCK_SCANNER_URL }}
-      # Other sensitive values should be provided as secrets and optionally passed into the job if you change the script to read them from env.
-      # Example (recommended): add SUPABASE_SERVICE_KEY, RESEND_API_KEY, SMTP credentials as secrets and map them here.
+      # 从 Secrets 读取默认 DR scanner 地址（推荐配置）
+      SECRET_DR_STOCK_SCANNER_URL: ${{ secrets.DR_STOCK_SCANNER_URL }}
+      # 你也可以在 Secrets 中添加并映射更多敏感配置，例如：
+      # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      # SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      # SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      # SMTP_USER: ${{ secrets.SMTP_USER }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -56,27 +58,34 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests python-dotenv
 
-      - name: Determine report type (Asia/Shanghai) and run email script
+      - name: Determine report type (Asia/Shanghai) and run email_system.py
         env:
-          # Inputs provided via workflow_dispatch (may be empty)
           INPUT_REPORT: ${{ github.event.inputs.report_type }}
-          INPUT_SCANNER_URL: ${{ github.event.inputs.stock_scanner_url }}
-          SECRET_SCANNER_URL: ${{ env.SECRET_STOCK_SCANNER_URL }}
+          INPUT_DR_SCANNER_URL: ${{ github.event.inputs.dr_stock_scanner_url }}
+          SECRET_DR_SCANNER_URL: ${{ env.SECRET_DR_STOCK_SCANNER_URL }}
+          # If you stored other secrets above, expose them here for the script to read:
+          # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          # SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          # SMTP_USER: ${{ secrets.SMTP_USER }}
         run: |
+          set -e
           echo "Event: $GITHUB_EVENT_NAME"
           echo "Manual input report_type: '$INPUT_REPORT'"
-          echo "Manual input stock_scanner_url: '$INPUT_SCANNER_URL'"
-          # Decide STOCK_SCANNER_URL: prefer manual input, otherwise repo secret
-          if [ -n "$INPUT_SCANNER_URL" ]; then
-            export STOCK_SCANNER_URL="$INPUT_SCANNER_URL"
-          else
-            export STOCK_SCANNER_URL="$SECRET_SCANNER_URL"
-          fi
-          echo "Using STOCK_SCANNER_URL=$STOCK_SCANNER_URL"
+          echo "Manual input dr_stock_scanner_url: '$INPUT_DR_SCANNER_URL'"
 
-          # If manual report_type supplied, use it; otherwise infer by Asia/Shanghai time
+          # Decide DR_STOCK_SCANNER_URL: prefer manual input, otherwise repo secret
+          if [ -n "$INPUT_DR_SCANNER_URL" ]; then
+            export DR_STOCK_SCANNER_URL="$INPUT_DR_SCANNER_URL"
+          else
+            export DR_STOCK_SCANNER_URL="$SECRET_DR_SCANNER_URL"
+          fi
+          echo "Using DR_STOCK_SCANNER_URL=$DR_STOCK_SCANNER_URL"
+
+          # Determine report type: manual override wins; otherwise infer from Asia/Shanghai local time
           if [ -n "$INPUT_REPORT" ]; then
             REPORT_TYPE="$INPUT_REPORT"
             echo "Using manual REPORT_TYPE=$REPORT_TYPE"
@@ -90,17 +99,19 @@ jobs:
             elif [ "$now" = "16:30" ]; then
               REPORT_TYPE="eod_summary"
             else
-              echo "Schedule triggered at unexpected local time ($now) and no manual report_type provided. Exiting."
+              echo "Schedule triggered at unexpected local time ($now) and no manual report_type provided. Exiting successfully."
               exit 0
             fi
             echo "Selected REPORT_TYPE based on schedule: $REPORT_TYPE"
           fi
 
-          # show python version
           python --version
-
-          # Run the script (update filename/path if necessary)
-          # If your script file name contains spaces (like "email_system.py") keep the quotes,
-          # but it's recommended to rename it to something without spaces.
-          python "email_system.py" "$REPORT_TYPE"
+          # Run the script; ensure your script reads DR_STOCK_SCANNER_URL from env
+          # The script filename is assumed to be 'email_system.py'
+          if [ ! -f "./email_system.py" ]; then
+            echo "错误：找不到 email_system.py，请确认文件名与路径正确"
+            exit 1
+          fi
+          # Pass the report type to the script
+          DR_STOCK_SCANNER_URL="$DR_STOCK_SCANNER_URL" python email_system.py "$REPORT_TYPE"
         working-directory: ${{ github.workspace }}
