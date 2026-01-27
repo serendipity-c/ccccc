@@ -1,7 +1,7 @@
 name: Scheduled Stock Email Reports
 
 on:
-  # ���个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
+  # 三个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
   # - 08:30 Asia/Shanghai => 00:30 UTC
   # - 12:00 Asia/Shanghai => 04:00 UTC
   # - 16:30 Asia/Shanghai => 08:30 UTC
@@ -9,17 +9,21 @@ on:
     - cron: '30 0 * * *'
     - cron: '0 4 * * *'
     - cron: '30 8 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      report_type:
+        description: '手动运行的报告类型：morning_brief | midday_review | eod_summary | all | by_time（按当前上海时间判断），默认 by_time'
+        required: false
+        default: 'by_time'
 
 jobs:
   run_report:
-    name: Run scheduled report (detect by Shanghai time)
+    name: Run scheduled or manual report (Shanghai time aware)
     runs-on: ubuntu-latest
     env:
-      # 明确时区为上海，脚本中使用 `date` 时将以此为准
+      # 明确时区为上海
       TZ: Asia/Shanghai
-      # 可选：如果你修改了 email_system.py 以从环境变量读取密钥，
-      # 你可以在此处将 GitHub Secrets 注入为环境变量，例如：
+      # 可选：将敏感密钥注入（推荐将这些值存为 GitHub Secrets 并在此处注入）
       # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       # ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
@@ -38,24 +42,56 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # 根据 email_system.py 中的引用，安装常用依赖（如需其它包可添加）
+            # 根据 email_system.py 中的引用，安装常用��赖（如需其它包可添加）
             pip install requests zhipuai akshare
           fi
 
-      - name: Run scheduled report (choose by Shanghai time)
+      - name: Run report (manual or scheduled)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_REPORT: ${{ github.event.inputs.report_type }}
         run: |
-          # 获取北京时间（Asia/Shanghai）
+          set -euo pipefail || true
+
           CURRENT_TIME=$(TZ=Asia/Shanghai date +'%H:%M')
+          echo "Event: $EVENT_NAME"
+          echo "Input report_type: '${INPUT_REPORT}'"
           echo "Current Shanghai time: $CURRENT_TIME"
-          if [ "$CURRENT_TIME" = "08:30" ]; then
-            echo "Running morning_brief"
-            python email_system.py morning_brief
-          elif [ "$CURRENT_TIME" = "12:00" ]; then
-            echo "Running midday_review"
-            python email_system.py midday_review
-          elif [ "$CURRENT_TIME" = "16:30" ]; then
-            echo "Running eod_summary"
-            python email_system.py eod_summary
+
+          run_by_time() {
+            # 根据当前上海时间判断要运行的报告
+            if [ "$CURRENT_TIME" = "08:30" ]; then
+              echo "Detected 08:30 Shanghai time -> running morning_brief"
+              python email_system.py morning_brief
+            elif [ "$CURRENT_TIME" = "12:00" ]; then
+              echo "Detected 12:00 Shanghai time -> running midday_review"
+              python email_system.py midday_review
+            elif [ "$CURRENT_TIME" = "16:30" ]; then
+              echo "Detected 16:30 Shanghai time -> running eod_summary"
+              python email_system.py eod_summary
+            else
+              echo "Not a scheduled time (08:30/12:00/16:30). Exiting without running reports."
+            fi
+          }
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            # 手动触发
+            if [ -n "${INPUT_REPORT}" ] && [ "${INPUT_REPORT}" != "by_time" ]; then
+              if [ "${INPUT_REPORT}" = "all" ]; then
+                echo "Manual: running all reports sequentially (morning_brief, midday_review, eod_summary)"
+                python email_system.py morning_brief || echo "morning_brief failed"
+                python email_system.py midday_review || echo "midday_review failed"
+                python email_system.py eod_summary || echo "eod_summary failed"
+              else
+                echo "Manual: running specified report -> ${INPUT_REPORT}"
+                python email_system.py "${INPUT_REPORT}"
+              fi
+            else
+              echo "Manual with 'by_time' or empty input -> fall back to time-based dispatch"
+              run_by_time
+            fi
           else
-            echo "Not a scheduled time. Exiting."
+            # 定时触发（来自 schedule）
+            echo "Scheduled event -> run_by_time"
+            run_by_time
           fi
