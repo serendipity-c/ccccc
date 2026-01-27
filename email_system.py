@@ -199,7 +199,7 @@ def get_users_with_email_enabled(report_type: str = 'morning_brief'):
 
 
 def get_user_watchlist(user_id: str):
-    """从数据库获取用户自选股票列表（根据 user_id，从 user_watchlist 表获取 name 和 code）"""
+    """从数据库获取用户自选股票列表（根据 user_id，从 user_watchlist 表只获取 name 列并做标准化）"""
     try:
         if not user_id:
             logger.debug("get_user_watchlist: user_id 为空，直接返回空列表")
@@ -211,10 +211,10 @@ def get_user_watchlist(user_id: str):
             'Content-Type': 'application/json'
         }
 
-        # 按照你的要求使用单数表名 user_watchlist，并只取 name 字段（及 code 以便后续使用）
+        # 只请求 name 列，避免请求不存在的列导致 42703 错误
         url = f'{SUPABASE_URL}/rest/v1/user_watchlist'
         params = {
-            'select': 'name,code',
+            'select': 'name',
             'user_id': f'eq.{user_id}'
         }
 
@@ -225,14 +225,26 @@ def get_user_watchlist(user_id: str):
             logger.error(f"查询自选股失败: {response.status_code} - {response.text}")
             return []
 
-        data = response.json()
-        logger.info(f"   用户 {user_id} 有 {len(data)} 只自选股")
-        return data
+        raw_data = response.json()
+        logger.debug(f"原始自选股响应 (user_watchlist) for user_id={user_id}: {raw_data}")
+
+        normalized = []
+        for row in raw_data:
+            # 以 name 字段为主；兼容性：如果你的表中存在不同列名，可在此处扩展
+            name = row.get('name') or row.get('stock_name') or ''
+            name = str(name).strip() if name is not None else ''
+
+            # 数据库中没有 code 列，所以这里把 code 设为空字符串以兼容后续逻辑
+            code = ''
+
+            normalized.append({'name': name, 'code': code})
+
+        logger.info(f"   用户 {user_id} 有 {len(normalized)} 只自选股（规范化后，仅包含 name）")
+        return normalized
 
     except Exception as e:
         logger.error(f"获取自选股失败: {e}")
         return []
-
 
 # ==================== 数据获取模块 ====================
 
