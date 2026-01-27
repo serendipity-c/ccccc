@@ -3,7 +3,7 @@
 # - Installs dependencies from requirements.txt if present, otherwise installs common deps
 # - Does not inject secrets (your email_system_v2.py currently hardcodes keys). 
 #   If you later move secrets to GitHub Secrets, inject them under job.env.
-name: Scheduled Stock Email Reports (v2)
+name: Scheduled Stock Email Reports
 
 on:
   # 三个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
@@ -22,12 +22,12 @@ on:
         default: 'by_time'
 
 jobs:
-  run_report_v2:
-    name: Run scheduled or manual report (v2, Shanghai time aware)
+  run_report:
+    name: Run scheduled or manual report (Shanghai time aware)
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-      # NOTE: email_system_v2.py currently hardcodes URLs/keys. If you migrate to GitHub Secrets,
+      # NOTE: email_system.py currently hardcodes URLs/keys. If you migrate to GitHub Secrets,
       # add them here, for example:
       # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -65,7 +65,7 @@ jobs:
           echo "=== pip show akshare ==="
           pip show akshare || echo "akshare not installed"
 
-      - name: Run report (manual or scheduled) - email_system_v2.py
+      - name: Run report (manual or scheduled) - email_system.py
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REPORT: ${{ github.event.inputs.report_type }}
@@ -80,13 +80,13 @@ jobs:
           run_by_time() {
             if [ "$CURRENT_TIME" = "08:30" ]; then
               echo "Detected 08:30 Shanghai time -> running morning_brief"
-              python email_system_v2.py morning_brief
+              python email_system.py morning_brief
             elif [ "$CURRENT_TIME" = "12:00" ]; then
               echo "Detected 12:00 Shanghai time -> running midday_review"
-              python email_system_v2.py midday_review
+              python email_system.py midday_review
             elif [ "$CURRENT_TIME" = "16:30" ]; then
               echo "Detected 16:30 Shanghai time -> running eod_summary"
-              python email_system_v2.py eod_summary
+              python email_system.py eod_summary
             else
               echo "Not a scheduled time (08:30/12:00/16:30). Exiting without running reports."
             fi
@@ -96,12 +96,12 @@ jobs:
             if [ -n "${INPUT_REPORT}" ] && [ "${INPUT_REPORT}" != "by_time" ]; then
               if [ "${INPUT_REPORT}" = "all" ]; then
                 echo "Manual: running all reports sequentially (morning_brief, midday_review, eod_summary)"
-                python email_system_v2.py morning_brief || echo "morning_brief failed"
-                python email_system_v2.py midday_review || echo "midday_review failed"
-                python email_system_v2.py eod_summary || echo "eod_summary failed"
+                python email_system.py morning_brief || echo "morning_brief failed"
+                python email_system.py midday_review || echo "midday_review failed"
+                python email_system.py eod_summary || echo "eod_summary failed"
               else
                 echo "Manual: running specified report -> ${INPUT_REPORT}"
-                python email_system_v2.py "${INPUT_REPORT}"
+                python email_system.py "${INPUT_REPORT}"
               fi
             else
               echo "Manual with 'by_time' or empty input -> fall back to time-based dispatch"
