@@ -1,4 +1,9 @@
-name: Scheduled Stock Email Reports
+# GitHub Actions workflow to run email_system_v2.py
+# - Supports schedule (三次/日) and manual workflow_dispatch (输入 report_type)
+# - Installs dependencies from requirements.txt if present, otherwise installs common deps
+# - Does not inject secrets (your email_system_v2.py currently hardcodes keys). 
+#   If you later move secrets to GitHub Secrets, inject them under job.env.
+name: Scheduled Stock Email Reports (v2)
 
 on:
   # 三个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
@@ -17,13 +22,16 @@ on:
         default: 'by_time'
 
 jobs:
-  run_report:
-    name: Run scheduled or manual report (Shanghai time aware)
+  run_report_v2:
+    name: Run scheduled or manual report (v2, Shanghai time aware)
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-      # NOTE: You requested all keys hardcoded in email_system.py, so no secrets are injected here.
-      # Warning: hardcoding secrets in source is insecure. Consider migrating to GitHub Secrets later.
+      # NOTE: email_system_v2.py currently hardcodes URLs/keys. If you migrate to GitHub Secrets,
+      # add them here, for example:
+      # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      # ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -41,24 +49,23 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies (use requirements.txt if present)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
-            # 使用国内镜像以提高稳定性（可移除 -i 参数）
             pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
           else
-            # 临时安装常见依赖，确保脚本可以运行
-            pip install requests akshare zhipuai pandas numpy lxml beautifulsoup4 openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple || true
+            # 安装常见依赖（如果你的 repo 没有 requirements.txt）
+            pip install requests zhipuai akshare pandas numpy lxml beautifulsoup4 openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple || true
           fi
           echo "=== pip list (first 40) ==="
           pip list | sed -n '1,40p'
-          echo "=== pip show akshare ==="
-          pip show akshare || echo "akshare not installed"
           echo "=== pip show zhipuai ==="
           pip show zhipuai || echo "zhipuai not installed"
+          echo "=== pip show akshare ==="
+          pip show akshare || echo "akshare not installed"
 
-      - name: Run report (manual or scheduled)
+      - name: Run report (manual or scheduled) - email_system_v2.py
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_REPORT: ${{ github.event.inputs.report_type }}
@@ -73,36 +80,34 @@ jobs:
           run_by_time() {
             if [ "$CURRENT_TIME" = "08:30" ]; then
               echo "Detected 08:30 Shanghai time -> running morning_brief"
-              python email_system.py morning_brief
+              python email_system_v2.py morning_brief
             elif [ "$CURRENT_TIME" = "12:00" ]; then
               echo "Detected 12:00 Shanghai time -> running midday_review"
-              python email_system.py midday_review
+              python email_system_v2.py midday_review
             elif [ "$CURRENT_TIME" = "16:30" ]; then
               echo "Detected 16:30 Shanghai time -> running eod_summary"
-              python email_system.py eod_summary
+              python email_system_v2.py eod_summary
             else
               echo "Not a scheduled time (08:30/12:00/16:30). Exiting without running reports."
             fi
           }
 
           if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            # 手动触发
             if [ -n "${INPUT_REPORT}" ] && [ "${INPUT_REPORT}" != "by_time" ]; then
               if [ "${INPUT_REPORT}" = "all" ]; then
                 echo "Manual: running all reports sequentially (morning_brief, midday_review, eod_summary)"
-                python email_system.py morning_brief || echo "morning_brief failed"
-                python email_system.py midday_review || echo "midday_review failed"
-                python email_system.py eod_summary || echo "eod_summary failed"
+                python email_system_v2.py morning_brief || echo "morning_brief failed"
+                python email_system_v2.py midday_review || echo "midday_review failed"
+                python email_system_v2.py eod_summary || echo "eod_summary failed"
               else
                 echo "Manual: running specified report -> ${INPUT_REPORT}"
-                python email_system.py "${INPUT_REPORT}"
+                python email_system_v2.py "${INPUT_REPORT}"
               fi
             else
               echo "Manual with 'by_time' or empty input -> fall back to time-based dispatch"
               run_by_time
             fi
           else
-            # 定时触发（来自 schedule）
             echo "Scheduled event -> run_by_time"
             run_by_time
           fi
