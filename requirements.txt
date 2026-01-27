@@ -1,1 +1,8 @@
 requests
+akshare
+zhipuai
+pandas
+numpy
+lxml
+beautifulsoup4
+openpyxl
