@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-邮件发送系统 - 单文件集成版本
-包含所有邮件发送功能，无需其他依赖模块
+AI驱动邮件发送系统 - 集成版
+包含所有邮件发送、AI内容生成、数据获取功能
 """
 
 import os
@@ -15,10 +15,22 @@ from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 import logging
 
-# 设置环境变量
-os.environ['RESEND_API_KEY'] = 're_Nm5shWrw_4Xp8c94P9VFQ12SC7BxEuuv7'
-os.environ['SUPABASE_URL'] = 'https://ayjxvejaztusajdntbkh.supabase.co'
-os.environ['SUPABASE_SERVICE_KEY'] = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5anh2ZWphenR1c2FqZG50YmtoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2ODQ0ODAxMSwiZXhwIjoyMDg0MDI0MDExfQ.2Ebe2Ft1gPEfyem0Qie9fGaQ8P3uhJvydGBFyCkvIgE'
+# ==================== 配置区 - 所有API密钥集中配置 ====================
+
+# Resend API (邮件发送)
+RESEND_API_KEY = 're_Nm5shWrw_4Xp8c94P9VFQ12SC7BxEuuv7'
+SMTP_HOST = 'smtp.resend.com'
+SMTP_PORT = 587
+SMTP_USER = 'resend'
+FROM_NAME = 'Portfolio Guardian'
+FROM_EMAIL = 'noreply@chenzhaoqi.asia'
+
+# Supabase (数据库)
+SUPABASE_URL = 'https://ayjxvejaztusajdntbkh.supabase.co'
+SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5anh2ZWphenR1c2FqZG50YmtoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2ODQ0ODAxMSwiZXhwIjoyMDg0MDI0MDExfQ.2Ebe2Ft1gPEfyem0Qie9fGaQ8P3uhJvydGBFyCkvIgE'
+
+# 智谱AI (内容生成)
+ZHIPUAI_API_KEY = '21f9ca7cfa0d44f4afeed5ed9d083b23.4zxzk7cZBhr0wnz7'
 
 # 配置日志
 logging.basicConfig(
@@ -26,6 +38,522 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ==================== 智谱AI模块 ====================
+
+def get_zhipu_client():
+    """获取智谱AI客户端"""
+    if not ZHIPUAI_API_KEY:
+        logger.warning("未设置 ZHIPUAI_API_KEY")
+        return None
+    try:
+        from zhipuai import ZhipuAI
+        return ZhipuAI(api_key=ZHIPUAI_API_KEY)
+    except ImportError:
+        logger.warning("zhipuai 未安装")
+        return None
+    except Exception as e:
+        logger.error(f"初始化智谱AI客户端失败: {e}")
+        return None
+
+
+def generate_ai_content(prompt: str) -> str:
+    """使用智谱AI生成内容"""
+    try:
+        client = get_zhipu_client()
+        if not client:
+            return None
+
+        logger.info("正在调用智谱AI生成内容...")
+
+        response = client.chat.completions.create(
+            model="glm-4-flash",
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+
+        content = response.choices[0].message.content
+        logger.info("AI内容生成成功")
+        return content
+
+    except Exception as e:
+        logger.error(f"AI生成内容失败: {e}")
+        return None
+
+
+# ==================== 数据库模块 ====================
+
+def get_users_with_email_enabled(report_type: str = 'morning_brief'):
+    """获取启用了特定邮件的用户"""
+    try:
+        logger.info(f"查询启用了 {report_type} 的用户...")
+
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json'
+        }
+
+        response = requests.get(
+            f'{SUPABASE_URL}/rest/v1/user_email_preferences',
+            params={
+                'select': '*',
+                'enabled': 'eq.true',
+                f'{report_type}->>enabled': 'eq.true'
+            },
+            headers=headers
+        )
+
+        if response.status_code != 200:
+            logger.error(f"查询失败: {response.status_code}")
+            return []
+
+        data = response.json()
+        logger.info(f"   找到 {len(data)} 个启用的用户")
+        return data
+
+    except Exception as e:
+        logger.error(f"获取用户列表失败: {e}")
+        return []
+
+
+def get_user_watchlist(user_id: str):
+    """从数据库获取用户自选股票列表"""
+    try:
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json'
+        }
+
+        response = requests.get(
+            f'{SUPABASE_URL}/rest/v1/user_watchlists',
+            params={
+                'select': '*',
+                'user_id': f'eq.{user_id}'
+            },
+            headers=headers
+        )
+
+        if response.status_code != 200:
+            logger.error(f"查询自选股失败: {response.status_code}")
+            return []
+
+        data = response.json()
+        logger.info(f"   用户有 {len(data)} 只自选股")
+        return data
+
+    except Exception as e:
+        logger.error(f"获取自选股失败: {e}")
+        return []
+
+
+# ==================== 数据获取模块 ====================
+
+def get_stock_news(stock_codes: list, days: int = 1):
+    """获取股票相关新闻（使用东方财富API）"""
+    try:
+        import akshare as ak
+        all_news = []
+
+        for code in stock_codes[:5]:
+            try:
+                news = ak.stock_news_em(symbol=code)
+                if not news.empty:
+                    news_list = news.head(10).to_dict('records')
+                    for item in news_list:
+                        all_news.append({
+                            'title': item.get('新闻标题', ''),
+                            'time': item.get('发布时间', ''),
+                            'source': '东方财富',
+                            'stock': code
+                        })
+            except Exception as e:
+                logger.warning(f"获取 {code} 新闻失败: {e}")
+                continue
+
+        return all_news[:30]
+
+    except ImportError:
+        logger.warning("akshare 未安装")
+        return []
+    except Exception as e:
+        logger.error(f"获取新闻失败: {e}")
+        return []
+
+
+def get_market_news_summary():
+    """获取市场整体新闻摘要"""
+    try:
+        import akshare as ak
+        news_summary = []
+
+        try:
+            news = ak.stock_news_em(symbol="000001")
+            if not news.empty:
+                recent_news = news.head(15).to_dict('records')
+                for item in recent_news:
+                    news_summary.append({
+                        'title': item.get('新闻标题', ''),
+                        'time': item.get('发布时间', '')
+                    })
+        except Exception as e:
+            logger.warning(f"获取市场新闻失败: {e}")
+
+        return news_summary[:20]
+
+    except ImportError:
+        logger.warning("akshare 未安装")
+        return []
+    except Exception as e:
+        logger.error(f"获取市场新闻失败: {e}")
+        return []
+
+
+def get_stock_quote(stock_code: str):
+    """获取个股实时行情"""
+    try:
+        import akshare as ak
+
+        quote = ak.stock_zh_a_spot_em()
+        stock_data = quote[quote['代码'] == stock_code]
+
+        if not stock_data.empty:
+            row = stock_data.iloc[0]
+            return {
+                'code': stock_code,
+                'name': row.get('名称', ''),
+                'price': row.get('最新价', 0),
+                'change': row.get('涨跌幅', 0),
+                'volume': row.get('成交量', 0),
+                'amount': row.get('成交额', 0),
+                'high': row.get('最高', 0),
+                'low': row.get('最低', 0),
+                'open': row.get('今开', 0),
+                'yesterday_close': row.get('昨收', 0)
+            }
+        return None
+
+    except ImportError:
+        logger.warning("akshare 未安装")
+        return None
+    except Exception as e:
+        logger.error(f"获取行情失败: {e}")
+        return None
+
+
+def get_market_index():
+    """获取主要指数行情"""
+    try:
+        import akshare as ak
+        indices = {}
+
+        try:
+            sz_index = ak.index_zh_a_spot_em()
+
+            sh_data = sz_index[sz_index['代码'] == '000001']
+            if not sh_data.empty:
+                indices['sh'] = {
+                    'name': '上证指数',
+                    'code': '000001',
+                    'price': sh_data.iloc[0].get('最新价', 0),
+                    'change': sh_data.iloc[0].get('涨跌幅', 0)
+                }
+
+            sz_data = sz_index[sz_index['代码'] == '399001']
+            if not sz_data.empty:
+                indices['sz'] = {
+                    'name': '深证成指',
+                    'code': '399001',
+                    'price': sz_data.iloc[0].get('最新价', 0),
+                    'change': sz_data.iloc[0].get('涨跌幅', 0)
+                }
+
+            cyb_data = sz_index[sz_index['代码'] == '399006']
+            if not cyb_data.empty:
+                indices['cyb'] = {
+                    'name': '创业板指',
+                    'code': '399006',
+                    'price': cyb_data.iloc[0].get('最新价', 0),
+                    'change': cyb_data.iloc[0].get('涨跌幅', 0)
+                }
+
+        except Exception as e:
+            logger.warning(f"获取指数行情失败: {e}")
+
+        return indices
+
+    except Exception as e:
+        logger.error(f"获取指数失败: {e}")
+        return {}
+
+
+# ==================== AI内容生成模块 ====================
+
+def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
+    """生成早市简报AI内容（9点）"""
+    try:
+        logger.info(f"为用户 {user_id[:12]}... 生成早市简报")
+
+        # 获取新闻数据
+        market_news = get_market_news_summary()
+        stock_codes = [s['code'] for s in watchlist]
+        stock_news = get_stock_news(stock_codes)
+
+        # 构建AI提示词
+        stock_list = ", ".join([f"{s.get('name', '')}({s.get('code', '')})" for s in watchlist[:5]])
+
+        news_context = ""
+        if market_news:
+            news_context += "\n【市场新闻】\n"
+            for news in market_news[:10]:
+                news_context += f"- {news['title']}\n"
+
+        if stock_news:
+            news_context += "\n【自选股相关新闻】\n"
+            for news in stock_news[:10]:
+                news_context += f"- [{news['stock']}] {news['title']}\n"
+
+        prompt = f"""
+你是一位专业的股市分析师。请根据以下信息，为用户生成一份个性化的早市简报（约500-800字）。
+
+用户自选股票：{stock_list}
+
+{news_context}
+
+请按以下结构生成内容（用HTML格式）：
+
+1. **市场回顾**（2-3句话总结前一交易日整体市场表现）
+2. **重点新闻解读**（挑选3-5条最重要或与自选股相关的新闻进行解读）
+3. **自选股关注**（基于新闻和市场情况，分析自选股中需要重点关注的内容）
+4. **今日展望**（对今日市场走势的预测，包括关键点位、关注板块等）
+5. **操作建议**（1-2条简要的操作策略建议）
+
+注意：
+- 保持专业、客观的语气
+- 重点突出与用户自选股相关的内容
+- 用数据支撑观点
+- 使用HTML标签格式化（如<p>、<strong>、<ul>、<li>等）
+"""
+
+        ai_content = generate_ai_content(prompt)
+
+        if ai_content:
+            return ai_content
+        else:
+            return generate_default_morning_brief(watchlist)
+
+    except Exception as e:
+        logger.error(f"生成早市简报失败: {e}")
+        return generate_default_morning_brief(watchlist)
+
+
+def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
+    """生成中市回顾AI内容（12点）"""
+    try:
+        logger.info(f"为用户 {user_id[:12]}... 生成中市回顾")
+
+        indices = get_market_index()
+        stock_quotes = []
+        for stock in watchlist[:10]:
+            quote = get_stock_quote(stock.get('code', ''))
+            if quote:
+                stock_quotes.append(quote)
+
+        stock_list = ", ".join([f"{s.get('name', '')}({s.get('code', '')})" for s in watchlist[:5]])
+
+        market_context = "\n【上午市场表现】\n"
+        for key, index in indices.items():
+            direction = "上涨" if index['change'] > 0 else "下跌"
+            market_context += f"- {index['name']}: {direction} {abs(index['change']):.2f}%\n"
+
+        stocks_context = "\n【自选股表现】\n"
+        for quote in stock_quotes:
+            direction = "上涨" if quote['change'] > 0 else "下跌"
+            stocks_context += f"- {quote['name']}({quote['code']}): {direction} {abs(quote['change']):.2f}%, 价格: {quote['price']}\n"
+
+        prompt = f"""
+你是一位专业的股市分析师。请根据以下上午市场数据，为用户生成一份中市回顾报告（约500-800字）。
+
+用户自选股票：{stock_list}
+
+{market_context}
+{stocks_context}
+
+请按以下结构生成内容（用HTML格式）：
+
+1. **上午市场综述**（分析上午整体市场走势和特点）
+2. **指数表现分析**（分析各指数的表现和背后的原因）
+3. **自选股走势回顾**（重点分析用户自选股的表现，涨跌榜分析）
+4. **热点板块解读**（分析上午表现突出的板块及原因）
+5. **午后关注点**（给出下午需要关注的重点和操作建议）
+
+注意：
+- 保持专业、客观的语气
+- 重点分析用户自选股的表现
+- 用数据支撑观点
+- 使用HTML标签格式化
+"""
+
+        ai_content = generate_ai_content(prompt)
+
+        if ai_content:
+            return ai_content
+        else:
+            return generate_default_midday_review(watchlist)
+
+    except Exception as e:
+        logger.error(f"生成中市回顾失败: {e}")
+        return generate_default_midday_review(watchlist)
+
+
+def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
+    """生成尾市总结AI内容（4点半）"""
+    try:
+        logger.info(f"为用户 {user_id[:12]}... 生成尾市总结")
+
+        indices = get_market_index()
+        stock_quotes = []
+        for stock in watchlist[:10]:
+            quote = get_stock_quote(stock.get('code', ''))
+            if quote:
+                stock_quotes.append(quote)
+
+        stock_list = ", ".join([f"{s.get('name', '')}({s.get('code', '')})" for s in watchlist[:5]])
+
+        market_context = "\n【今日收盘数据】\n"
+        for key, index in indices.items():
+            direction = "上涨" if index['change'] > 0 else "下跌"
+            market_context += f"- {index['name']}: {direction} {abs(index['change']):.2f}%\n"
+
+        stock_quotes_sorted = sorted(stock_quotes, key=lambda x: x['change'], reverse=True)
+
+        stocks_context = "\n【自选股今日表现】\n"
+        if stock_quotes_sorted:
+            top_gainers = stock_quotes_sorted[:3]
+            top_losers = stock_quotes_sorted[-3:]
+
+            stocks_context += "\n涨幅榜前三：\n"
+            for quote in top_gainers:
+                stocks_context += f"- {quote['name']}: +{quote['change']:.2f}%\n"
+
+            stocks_context += "\n跌幅榜前三：\n"
+            for quote in reversed(top_losers):
+                stocks_context += f"- {quote['name']}: {quote['change']:.2f}%\n"
+
+        prompt = f"""
+你是一位专业的股市分析师。请根据以下今日收盘数据，为用户生成一份尾市总结报告（约600-900字）。
+
+用户自选股票：{stock_list}
+
+{market_context}
+{stocks_context}
+
+请按以下结构生成内容（用HTML格式）：
+
+1. **今日市场总结**（总结今日整体市场表现，包括成交量、涨跌比等）
+2. **盘面深度分析**（分析今日市场走势背后的逻辑和驱动因素）
+3. **自选股复盘**（详细复盘用户自选股今日表现，分析涨跌原因）
+4. **资金流向分析**（分析北向资金、主力资金等流向情况）
+5. **明日市场展望**（预测明日市场走势，给出关键点位和关注板块）
+6. **操作策略建议**（基于今日情况，给出明日具体的操作建议）
+
+注意：
+- 保持专业、客观的语气
+- 深入分析，不仅描述现象，更要分析原因
+- 重点复盘用户自选股
+- 给出具体可操作的建议
+- 使用HTML标签格式化
+"""
+
+        ai_content = generate_ai_content(prompt)
+
+        if ai_content:
+            return ai_content
+        else:
+            return generate_default_eod_summary(watchlist)
+
+    except Exception as e:
+        logger.error(f"生成尾市总结失败: {e}")
+        return generate_default_eod_summary(watchlist)
+
+
+# ==================== 默认内容生成函数（备用） ====================
+
+def generate_default_morning_brief(watchlist: list) -> str:
+    """生成默认早市简报（AI调用失败时使用）"""
+    stock_list = ", ".join([f"{s.get('name', '')}" for s in watchlist[:5]])
+
+    return f"""
+    <h2 style="margin: 0 0 16px 0; color: #333;">📅 早市简报</h2>
+
+    <div style="margin: 20px 0; padding: 16px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 6px;">
+        <h3 style="margin: 0 0 8px 0; color: #856404;">⚠️ AI服务暂时不可用</h3>
+        <p style="margin: 0; color: #856404; line-height: 1.6;">
+            当前使用默认内容。请检查智谱AI配置（在代码顶部设置 ZHIPUAI_API_KEY）。
+        </p>
+    </div>
+
+    <div style="margin: 20px 0;">
+        <h3 style="margin: 0 0 12px 0; color: #333;">您的自选股</h3>
+        <p style="margin: 0; color: #666; line-height: 1.6;">
+            {stock_list if stock_list else '暂无自选股'}
+        </p>
+    </div>
+
+    <div style="margin: 20px 0;">
+        <h3 style="margin: 0 0 12px 0; color: #333;">市场提醒</h3>
+        <p style="margin: 0; color: #666; line-height: 1.6;">
+            请关注今日市场开盘情况，密切关注您的自选股走势。
+        </p>
+    </div>
+    """
+
+
+def generate_default_midday_review(watchlist: list) -> str:
+    """生成默认中市回顾（AI调用失败时使用）"""
+    return f"""
+    <h2 style="margin: 0 0 16px 0; color: #333;">☀️ 中市回顾</h2>
+
+    <div style="margin: 20px 0; padding: 16px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 6px;">
+        <h3 style="margin: 0 0 8px 0; color: #856404;">⚠️ AI服务暂时不可用</h3>
+        <p style="margin: 0; color: #856404; line-height: 1.6;">
+            当前使用默认内容。请检查智谱AI配置（在代码顶部设置 ZHIPUAI_API_KEY）。
+        </p>
+    </div>
+
+    <div style="margin: 20px 0;">
+        <h3 style="margin: 0 0 12px 0; color: #333;">午间提醒</h3>
+        <p style="margin: 0; color: #666; line-height: 1.6;">
+            市场正在进行中，请关注下午行情变化。
+        </p>
+    </div>
+    """
+
+
+def generate_default_eod_summary(watchlist: list) -> str:
+    """生成默认尾市总结（AI调用失败时使用）"""
+    return f"""
+    <h2 style="margin: 0 0 16px 0; color: #333;">🌙 尾市总结</h2>
+
+    <div style="margin: 20px 0; padding: 16px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 6px;">
+        <h3 style="margin: 0 0 8px 0; color: #856404;">⚠️ AI服务暂时不可用</h3>
+        <p style="margin: 0; color: #856404; line-height: 1.6;">
+            当前使用默认内容。请检查智谱AI配置（在代码顶部设置 ZHIPUAI_API_KEY）。
+        </p>
+    </div>
+
+    <div style="margin: 20px 0;">
+        <h3 style="margin: 0 0 12px 0; color: #333;">收盘提醒</h3>
+        <p style="margin: 0; color: #666; line-height: 1.6;">
+            今日市场已收盘，请查看您的自选股表现。
+        </p>
+    </div>
+    """
 
 
 # ==================== 邮件发送模块 ====================
@@ -75,18 +603,10 @@ def send_email(to_email: str, subject: str, html_content: str) -> bool:
         logger.info(f"准备发送邮件到: {to_email}")
         logger.info(f"   主题: {subject}")
 
-        # 获取配置
-        smtp_host = 'smtp.resend.com'
-        smtp_port = 587
-        smtp_user = 'resend'
-        resend_api_key = os.getenv('RESEND_API_KEY')
-        from_name = 'Portfolio Guardian'
-        from_email = 'noreply@chenzhaoqi.asia'
-
         # 创建邮件
         msg = MIMEMultipart('alternative')
         msg['Subject'] = subject
-        msg['From'] = formataddr((from_name, from_email))
+        msg['From'] = formataddr((FROM_NAME, FROM_EMAIL))
         msg['To'] = to_email
 
         # 添加 HTML 内容
@@ -94,24 +614,21 @@ def send_email(to_email: str, subject: str, html_content: str) -> bool:
         msg.attach(html_part)
 
         # 连接到 SMTP 服务器
-        logger.info(f"   连接到 SMTP 服务器: {smtp_host}:{smtp_port}")
+        logger.info(f"   连接到 SMTP 服务器: {SMTP_HOST}:{SMTP_PORT}")
 
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()  # 启用 TLS
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
             logger.info("   TLS 已启用")
 
-            # 登录
-            server.login(smtp_user, resend_api_key)
+            server.login(SMTP_USER, RESEND_API_KEY)
             logger.info("   SMTP 登录成功")
 
-            # 发送邮件
             server.send_message(msg)
             logger.info(f"邮件发送成功到 {to_email}")
             return True
 
     except smtplib.SMTPAuthenticationError as e:
         logger.error(f"SMTP 认证失败: {e}")
-        logger.error("   请检查 RESEND_API_KEY 是否正确")
         return False
     except smtplib.SMTPException as e:
         logger.error(f"SMTP 错误: {e}")
@@ -121,314 +638,11 @@ def send_email(to_email: str, subject: str, html_content: str) -> bool:
         return False
 
 
-# ==================== 数据库模块 ====================
-
-def get_users_with_email_enabled(report_type: str = 'morning_brief'):
-    """获取启用了特定邮件的用户"""
-    try:
-        logger.info(f"查询启用了 {report_type} 的用户...")
-
-        url = os.getenv('SUPABASE_URL')
-        service_key = os.getenv('SUPABASE_SERVICE_KEY')
-
-        headers = {
-            'apikey': service_key,
-            'Authorization': f'Bearer {service_key}',
-            'Content-Type': 'application/json'
-        }
-
-        # 查询启用了邮件的用户
-        response = requests.get(
-            f'{url}/rest/v1/user_email_preferences',
-            params={
-                'select': '*',
-                'enabled': 'eq.true',
-                f'{report_type}->>enabled': 'eq.true'
-            },
-            headers=headers
-        )
-
-        if response.status_code != 200:
-            logger.error(f"查询失败: {response.status_code}")
-            logger.error(f"   响应: {response.text}")
-            return []
-
-        data = response.json()
-        logger.info(f"   找到 {len(data)} 个启用的用户")
-
-        return data
-
-    except Exception as e:
-        logger.error(f"获取用户列表失败: {e}")
-        return []
-
-
-# ==================== 邮件内容生成模块 ====================
-
-def generate_morning_brief_content() -> str:
-    """生成早市简报内容"""
-    today = datetime.now().strftime('%Y年%m月%d日 %A')
-
-    content = f"""
-    <h2 style="margin: 0 0 16px 0; color: #333;">📅 早市简报 - {today}</h2>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #f0fdf4; border-left: 4px solid #16a34a; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #166534;">✅ 系统运行正常</h3>
-        <p style="margin: 0; color: #166534; line-height: 1.6;">
-            这是使用 Python smtplib 发送的测试邮件。
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">📰 市场回顾</h3>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>前一交易日市场表现：</strong>
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            • 上证指数收盘涨跌幅：+0.5%
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            • 深证成指收盘涨跌幅：+0.3%
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            • 创业板指收盘涨跌幅：+0.8%
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">🤖 AI 市场预测</h3>
-        <p style="margin: 0; color: #666; line-height: 1.6;">
-            <strong>整体趋势：</strong><span style="color: #16a34a;">中性偏乐观</span>
-        </p>
-        <p style="margin: 8px 0; color: #666; line-height: 1.6;">
-            <strong>关键点位：</strong>上证指数 支撑3050 / 压力3100
-        </p>
-        <p style="margin: 8px 0; color: #666; line-height: 1.6;">
-            <strong>关注板块：</strong>新能源、半导体、消费、医药
-        </p>
-        <p style="margin: 8px 0; color: #666; line-height: 1.6;">
-            <strong>风险提示：</strong>海外市场波动、政策不确定性
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">📌 今日关注</h3>
-        <ul style="margin: 8px 0; padding-left: 20px; color: #666; line-height: 1.6;">
-            <li>关注成交量变化趋势</li>
-            <li>北向资金流向</li>
-            <li>重点公司公告</li>
-            <li>行业政策动态</li>
-        </ul>
-    </div>
-
-    <div style="margin-top: 24px; padding: 12px; background-color: #fef3c7; border-radius: 4px;">
-        <p style="margin: 0; color: #92400e; font-size: 13px;">
-            ⏰ 发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        </p>
-    </div>
-    """
-    return content
-
-
-def generate_midday_review_content() -> str:
-    """生成中市回顾内容"""
-    today = datetime.now().strftime('%Y年%m月%d日 %A')
-    current_time = datetime.now().strftime('%H:%M')
-
-    content = f"""
-    <h2 style="margin: 0 0 16px 0; color: #333;">☀️ 中市回顾 - {today}</h2>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #fef3c7; border-left: 4px solid #f59e0b; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #92400e;">⏰ 盘中更新</h3>
-        <p style="margin: 0; color: #92400e; line-height: 1.6;">
-            当前时间：{current_time} | 市场正在进行中
-        </p>
-    </div>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #f0fdf4; border-left: 4px solid #16a34a; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #166534;">✅ 系统运行正常</h3>
-        <p style="margin: 0; color: #166534; line-height: 1.6;">
-            这是使用 Python smtplib 发送的中市回顾邮件。
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">📊 上午市场表现</h3>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>上证指数：</strong>上涨 0.5% | 成交量 1200亿
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>深证成指：</strong>上涨 0.3% | 成交量 1500亿
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>创业板指：</strong>上涨 0.8% | 成交量 800亿
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">🔥 热门板块</h3>
-        <ul style="margin: 8px 0; padding-left: 20px; color: #666; line-height: 1.6;">
-            <li><strong>新能源</strong> +2.3% - 政策利好持续发酵</li>
-            <li><strong>半导体</strong> +1.8% - 国产替代加速</li>
-            <li><strong>消费电子</strong> +1.2% - 新品发布预期</li>
-            <li><strong>医药生物</strong> -0.5% - 短期调整</li>
-        </ul>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">💰 资金流向</h3>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>北向资金：</strong>净流入 35亿元
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>主力资金：</strong>净流出 12亿元
-        </p>
-        <p style="margin: 8px 0; color: #666; line-height: 1.6;">
-            <strong>机构动向：</strong>加仓科技、减仓周期
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">📌 午后关注</h3>
-        <ul style="margin: 8px 0; padding-left: 20px; color: #666; line-height: 1.6;">
-            <li>关注成交量能否持续放大</li>
-            <li>重点板块的延续性</li>
-            <li>尾盘资金流向变化</li>
-            <li>港股走势影响</li>
-        </ul>
-    </div>
-
-    <div style="margin-top: 24px; padding: 12px; background-color: #fef3c7; border-radius: 4px;">
-        <p style="margin: 0; color: #92400e; font-size: 13px;">
-            ⏰ 发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        </p>
-    </div>
-    """
-    return content
-
-
-def generate_eod_summary_content() -> str:
-    """生成尾市总结内容"""
-    today = datetime.now().strftime('%Y年%m月%d日 %A')
-
-    content = f"""
-    <h2 style="margin: 0 0 16px 0; color: #333;">🌙 尾市总结 - {today}</h2>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #eff6ff; border-left: 4px solid #3b82f6; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #1e40af;">🏁 今日收盘</h3>
-        <p style="margin: 0; color: #1e40af; line-height: 1.6;">
-            市场已收盘，今日交易结束
-        </p>
-    </div>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #f0fdf4; border-left: 4px solid #16a34a; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #166534;">✅ 系统运行正常</h3>
-        <p style="margin: 0; color: #166534; line-height: 1.6;">
-            这是使用 Python smtplib 发送的尾市总结邮件。
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">📈 今日大盘表现</h3>
-        <table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
-            <tr style="background-color: #f3f4f6;">
-                <th style="padding: 10px; text-align: left; border: 1px solid #e5e7eb;">指数</th>
-                <th style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">收盘</th>
-                <th style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">涨跌幅</th>
-                <th style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">成交量</th>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">上证指数</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">3,085.25</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #16a34a;">+0.52%</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">2,850亿</td>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">深证成指</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">10,156.33</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #16a34a;">+0.35%</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">3,420亿</td>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">创业板指</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">2,034.21</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #16a34a;">+0.78%</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">1,580亿</td>
-            </tr>
-        </table>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">🎯 今日亮点</h3>
-        <ul style="margin: 8px 0; padding-left: 20px; color: #666; line-height: 1.6;">
-            <li><strong>三大指数全红收盘</strong> - 市场情绪回暖</li>
-            <li><strong>新能源板块领涨</strong> - 政策利好持续发酵</li>
-            <li><strong>成交额放量</strong> - 两市合计超 8000亿</li>
-            <li><strong>北向资金净流入</strong> - 全天净流入 52亿元</li>
-        </ul>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">📊 板块表现</h3>
-        <table style="width: 100%; border-collapse: collapse; margin: 12px 0;">
-            <tr style="background-color: #f3f4f6;">
-                <th style="padding: 10px; text-align: left; border: 1px solid #e5e7eb;">板块</th>
-                <th style="padding: 10px; text-align: right; border: 1px solid #e5e7eb;">涨跌幅</th>
-                <th style="padding: 10px; text-align: left; border: 1px solid #e5e7eb;">原因</th>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">新能源</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #16a34a;">+2.8%</td>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">政策支持</td>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">半导体</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #16a34a;">+2.1%</td>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">国产替代</td>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">房地产</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #dc2626;">-1.5%</td>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">获利回吐</td>
-            </tr>
-            <tr>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">银行</td>
-                <td style="padding: 10px; text-align: right; border: 1px solid #e5e7eb; color: #dc2626;">-0.8%</td>
-                <td style="padding: 10px; border: 1px solid #e5e7eb;">调整压力</td>
-            </tr>
-        </table>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">💡 明日展望</h3>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>技术面：</strong>上证指数站稳 3050 点，有望挑战 3100 点
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>资金面：</strong>北向资金持续流入，市场信心恢复
-        </p>
-        <p style="margin: 0 0 8px 0; color: #666; line-height: 1.6;">
-            <strong>关注点：</strong>成交量能否持续放大、政策面动态
-        </p>
-        <p style="margin: 8px 0; color: #666; line-height: 1.6;">
-            <strong>风险提示：</strong>海外市场波动、量能不足风险
-        </p>
-    </div>
-
-    <div style="margin-top: 24px; padding: 12px; background-color: #fef3c7; border-radius: 4px;">
-        <p style="margin: 0; color: #92400e; font-size: 13px;">
-            ⏰ 发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-        </p>
-    </div>
-    """
-    return content
-
-
 # ==================== 主发送函数 ====================
 
 def send_report(report_type: str):
     """
-    发送指定类型的报告
+    发送指定类型的报告（使用AI生成个性化内容）
 
     Args:
         report_type: 报告类型 ('morning_brief', 'midday_review', 'eod_summary')
@@ -439,6 +653,12 @@ def send_report(report_type: str):
         'morning_brief': '早市简报',
         'midday_review': '中市回顾',
         'eod_summary': '尾市总结'
+    }
+
+    title_prefixes = {
+        'morning_brief': '📅 早市简报',
+        'midday_review': '☀️ 中市回顾',
+        'eod_summary': '🌙 尾市总结'
     }
 
     logger.info(f"开始执行：{report_names.get(report_type, report_type)}")
@@ -458,21 +678,9 @@ def send_report(report_type: str):
         success_count = 0
         failed_count = 0
 
-        # 生成邮件内容
-        if report_type == 'morning_brief':
-            content = generate_morning_brief_content()
-            title_prefix = '📅 早市简报'
-        elif report_type == 'midday_review':
-            content = generate_midday_review_content()
-            title_prefix = '☀️ 中市回顾'
-        elif report_type == 'eod_summary':
-            content = generate_eod_summary_content()
-            title_prefix = '🌙 尾市总结'
-        else:
-            logger.error(f"未知的报告类型: {report_type}")
-            return
+        title_prefix = title_prefixes.get(report_type, '📊 股市报告')
 
-        # 为每个用户发送邮件
+        # 为每个用户发送个性化邮件
         for user in users:
             user_id = user.get('user_id', '')
             email = user.get('email', '')
@@ -482,6 +690,24 @@ def send_report(report_type: str):
 
             if not email:
                 logger.warning("   用户没有设置邮箱，跳过")
+                failed_count += 1
+                continue
+
+            # 获取用户自选股
+            logger.info("   获取用户自选股...")
+            watchlist = get_user_watchlist(user_id)
+            logger.info(f"   找到 {len(watchlist)} 只自选股")
+
+            # 使用AI生成个性化内容
+            logger.info("   使用AI生成个性化内容...")
+            if report_type == 'morning_brief':
+                content = generate_morning_brief_ai(user_id, watchlist)
+            elif report_type == 'midday_review':
+                content = generate_midday_review_ai(user_id, watchlist)
+            elif report_type == 'eod_summary':
+                content = generate_eod_summary_ai(user_id, watchlist)
+            else:
+                logger.error(f"未知的报告类型: {report_type}")
                 failed_count += 1
                 continue
 
@@ -516,14 +742,18 @@ def main():
         print("用法: python email_system.py <report_type>")
         print("")
         print("报告类型:")
-        print("  morning_brief  - 早市简报")
-        print("  midday_review  - 中市回顾")
-        print("  eod_summary    - 尾市总结")
+        print("  morning_brief  - 早市简报 (9:00)")
+        print("  midday_review  - 中市回顾 (12:00)")
+        print("  eod_summary    - 尾市总结 (16:30)")
         print("")
         print("示例:")
         print("  python email_system.py morning_brief")
         print("  python email_system.py midday_review")
         print("  python email_system.py eod_summary")
+        print("")
+        print("配置说明:")
+        print("  所有API密钥都在代码顶部的配置区")
+        print("  请修改代码中的 ZHIPUAI_API_KEY 变量")
         sys.exit(1)
 
     report_type = sys.argv[1].lower()
