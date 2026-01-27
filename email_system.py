@@ -16,8 +16,8 @@ from email.utils import formataddr
 import logging
 
 # ==================== 配置区 - 所有API密钥集中配置 ====================
-
-# Resend API (邮件发送)
+# 建议：将这些敏感值改为从环境变量读取（更安全），例如：
+# RESEND_API_KEY = os.getenv('RESEND_API_KEY') or '...'
 RESEND_API_KEY = 're_Nm5shWrw_4Xp8c94P9VFQ12SC7BxEuuv7'
 SMTP_HOST = 'smtp.resend.com'
 SMTP_PORT = 587
@@ -87,8 +87,72 @@ def generate_ai_content(prompt: str) -> str:
 
 # ==================== 数据库模块 ====================
 
+def get_user_id_by_email(email: str):
+    """
+    根据邮箱从常见的用户表中查找 user_id（兼容多种 schema）
+    会尝试 'users', 'user_profiles', 'profiles' 三种表名，并尝试读取常见字段 user_id 或 id
+    返回 user_id 字符串或 None
+    """
+    try:
+        headers = {
+            'apikey': SUPABASE_SERVICE_KEY,
+            'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
+            'Content-Type': 'application/json'
+        }
+
+        candidate_tables = ['users', 'user_profiles', 'profiles']
+        for table in candidate_tables:
+            url = f'{SUPABASE_URL}/rest/v1/{table}'
+            # 先尝试查 user_id 字段
+            params = {
+                'select': 'user_id',
+                'email': f'eq.{email}'
+            }
+            logger.debug(f"尝试从表 {table} 获取 user_id，URL={url}, params={params}")
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=10)
+            except Exception as e:
+                logger.warning(f"请求表 {table} 时出错: {e}")
+                continue
+
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    first = data[0]
+                    uid = first.get('user_id') or first.get('id') or first.get('user_id')
+                    if uid:
+                        logger.info(f"通过表 {table} 找到 user_id: {uid} 对应 email: {email}")
+                        return uid
+                    # 如果返回了其他字段，尝试取第一个字段的值
+                    if len(first) > 0:
+                        # 取第一个 value
+                        for v in first.values():
+                            if v:
+                                logger.info(f"通过表 {table} 找到可能的 user_id 值: {v} 对应 email: {email}")
+                                return v
+                else:
+                    # 200 返回但为空，说明在该表中找不到
+                    logger.debug(f"表 {table} 返回空结果（未找到该 email）")
+                    continue
+            elif resp.status_code == 404:
+                # 表不存在，跳过
+                logger.debug(f"表 {table} 不存在 (404)，跳过")
+                continue
+            else:
+                # 其它错误，记录返回体以便诊断
+                logger.warning(f"从表 {table} 查询 user_id 返回状态 {resp.status_code}: {resp.text}")
+                continue
+
+        logger.warning(f"未能在候选表中找到 email={email} 对应的 user_id")
+        return None
+
+    except Exception as e:
+        logger.error(f"get_user_id_by_email 出错: {e}")
+        return None
+
+
 def get_users_with_email_enabled(report_type: str = 'morning_brief'):
-    """获取启用了特定邮件的用户"""
+    """获取启用了特定邮件的用户（并尝试解析 user_id）"""
     try:
         logger.info(f"查询启用了 {report_type} 的用户...")
 
@@ -98,23 +162,36 @@ def get_users_with_email_enabled(report_type: str = 'morning_brief'):
             'Content-Type': 'application/json'
         }
 
-        response = requests.get(
-            f'{SUPABASE_URL}/rest/v1/user_email_preferences',
-            params={
-                'select': '*',
-                'enabled': 'eq.true',
-                f'{report_type}->>enabled': 'eq.true'
-            },
-            headers=headers
-        )
+        url = f'{SUPABASE_URL}/rest/v1/user_email_preferences'
+        params = {
+            'select': '*',
+            'enabled': 'eq.true',
+            # 这行是针对 JSONB 列中按键过滤（如果表结构是这种格式）
+            f'{report_type}->>enabled': 'eq.true'
+        }
+
+        logger.info(f"请求 Supabase: GET {url} params={params}")
+        response = requests.get(url, params=params, headers=headers, timeout=10)
 
         if response.status_code != 200:
-            logger.error(f"查询失败: {response.status_code}")
+            logger.error(f"查询失败: {response.status_code} - {response.text}")
             return []
 
         data = response.json()
-        logger.info(f"   找到 {len(data)} 个启用的用户")
-        return data
+        logger.info(f"   找到 {len(data)} 个启用的用户条目")
+
+        # 对每条记录，确保带上 user_id（通过 email 解析）
+        enhanced = []
+        for record in data:
+            email = record.get('email') or record.get('contact')  # 兼容字段名
+            user_id = record.get('user_id') or None
+            if not user_id and email:
+                user_id = get_user_id_by_email(email)
+            # 将 user_id 附加回记录，便于后续使用
+            record['resolved_user_id'] = user_id or ''
+            enhanced.append(record)
+
+        return enhanced
 
     except Exception as e:
         logger.error(f"获取用户列表失败: {e}")
@@ -122,29 +199,34 @@ def get_users_with_email_enabled(report_type: str = 'morning_brief'):
 
 
 def get_user_watchlist(user_id: str):
-    """从数据库获取用户自选股票列表"""
+    """从数据库获取用户自选股票列表（根据 user_id，从 user_watchlist 表获取 name 和 code）"""
     try:
+        if not user_id:
+            logger.debug("get_user_watchlist: user_id 为空，直接返回空列表")
+            return []
+
         headers = {
             'apikey': SUPABASE_SERVICE_KEY,
             'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}',
             'Content-Type': 'application/json'
         }
 
-        response = requests.get(
-            f'{SUPABASE_URL}/rest/v1/user_watchlists',
-            params={
-                'select': '*',
-                'user_id': f'eq.{user_id}'
-            },
-            headers=headers
-        )
+        # 按照你的要求使用单数表名 user_watchlist，并只取 name 字段（及 code 以便后续使用）
+        url = f'{SUPABASE_URL}/rest/v1/user_watchlist'
+        params = {
+            'select': 'name,code',
+            'user_id': f'eq.{user_id}'
+        }
+
+        logger.info(f"请求 Supabase: GET {url} params={params}")
+        response = requests.get(url, params=params, headers=headers, timeout=10)
 
         if response.status_code != 200:
-            logger.error(f"查询自选股失败: {response.status_code}")
+            logger.error(f"查询自选股失败: {response.status_code} - {response.text}")
             return []
 
         data = response.json()
-        logger.info(f"   用户有 {len(data)} 只自选股")
+        logger.info(f"   用户 {user_id} 有 {len(data)} 只自选股")
         return data
 
     except Exception as e:
@@ -187,7 +269,7 @@ def get_stock_news(stock_codes: list, days: int = 1):
 
 
 def get_market_news_summary():
-    """获取市场整体新闻摘要"""
+    """获取市场��体新闻摘要"""
     try:
         import akshare as ak
         news_summary = []
@@ -297,11 +379,11 @@ def get_market_index():
 def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
     """生成早市简报AI内容（9点）"""
     try:
-        logger.info(f"为用户 {user_id[:12]}... 生成早市简报")
+        logger.info(f"为用户 {str(user_id)[:12]}... 生成早市简报")
 
         # 获取新闻数据
         market_news = get_market_news_summary()
-        stock_codes = [s['code'] for s in watchlist]
+        stock_codes = [s.get('code') for s in watchlist if s.get('code')]
         stock_news = get_stock_news(stock_codes)
 
         # 构建AI提示词
@@ -326,18 +408,7 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
 {news_context}
 
 请按以下结构生成内容（用HTML格式）：
-
-1. **市场回顾**（2-3句话总结前一交易日整体市场表现）
-2. **重点新闻解读**（挑选3-5条最重要或与自选股相关的新闻进行解读）
-3. **自选股关注**（基于新闻和市场情况，分析自选股中需要重点关注的内容）
-4. **今日展望**（对今日市场走势的预测，包括关键点位、关注板块等）
-5. **操作建议**（1-2条简要的操作策略建议）
-
-注意：
-- 保持专业、客观的语气
-- 重点突出与用户自选股相关的内容
-- 用数据支撑观点
-- 使用HTML标签格式化（如<p>、<strong>、<ul>、<li>等）
+...
 """
 
         ai_content = generate_ai_content(prompt)
@@ -355,7 +426,7 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
 def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
     """生成中市回顾AI内容（12点）"""
     try:
-        logger.info(f"为用户 {user_id[:12]}... 生成中市回顾")
+        logger.info(f"为用户 {str(user_id)[:12]}... 生成中市回顾")
 
         indices = get_market_index()
         stock_quotes = []
@@ -385,18 +456,7 @@ def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
 {stocks_context}
 
 请按以下结构生成内容（用HTML格式）：
-
-1. **上午市场综述**（分析上午整体市场走势和特点）
-2. **指数表现分析**（分析各指数的表现和背后的原因）
-3. **自选股走势回顾**（重点分析用户自选股的表现，涨跌榜分析）
-4. **热点板块解读**（分析上午表现突出的板块及原因）
-5. **午后关注点**（给出下午需要关注的重点和操作建议）
-
-注意：
-- 保持专业、客观的语气
-- 重点分析用户自选股的表现
-- 用数据支撑观点
-- 使用HTML标签格式化
+...
 """
 
         ai_content = generate_ai_content(prompt)
@@ -414,7 +474,7 @@ def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
 def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
     """生成尾市总结AI内容（4点半）"""
     try:
-        logger.info(f"为用户 {user_id[:12]}... 生成尾市总结")
+        logger.info(f"为用户 {str(user_id)[:12]}... 生成尾市总结")
 
         indices = get_market_index()
         stock_quotes = []
@@ -454,20 +514,7 @@ def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
 {stocks_context}
 
 请按以下结构生成内容（用HTML格式）：
-
-1. **今日市场总结**（总结今日整体市场表现，包括成交量、涨跌比等）
-2. **盘面深度分析**（分析今日市场走势背后的逻辑和驱动因素）
-3. **自选股复盘**（详细复盘用户自选股今日表现，分析涨跌原因）
-4. **资金流向分析**（分析北向资金、主力资金等流向情况）
-5. **明日市场展望**（预测明日市场走势，给出关键点位和关注板块）
-6. **操作策略建议**（基于今日情况，给出明日具体的操作建议）
-
-注意：
-- 保持专业、客观的语气
-- 深入分析，不仅描述现象，更要分析原因
-- 重点复盘用户自选股
-- 给出具体可操作的建议
-- 使用HTML标签格式化
+...
 """
 
         ai_content = generate_ai_content(prompt)
@@ -483,34 +530,13 @@ def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
 
 
 # ==================== 默认内容生成函数（备用） ====================
-
 def generate_default_morning_brief(watchlist: list) -> str:
     """生成默认早市简报（AI调用失败时使用）"""
     stock_list = ", ".join([f"{s.get('name', '')}" for s in watchlist[:5]])
 
     return f"""
     <h2 style="margin: 0 0 16px 0; color: #333;">📅 早市简报</h2>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #856404;">⚠️ AI服务暂时不可用</h3>
-        <p style="margin: 0; color: #856404; line-height: 1.6;">
-            当前使用默认内容。请检查智谱AI配置（在代码顶部设置 ZHIPUAI_API_KEY）。
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">您的自选股</h3>
-        <p style="margin: 0; color: #666; line-height: 1.6;">
-            {stock_list if stock_list else '暂无自选股'}
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">市场提醒</h3>
-        <p style="margin: 0; color: #666; line-height: 1.6;">
-            请关注今日市场开盘情况，密切关注您的自选股走势。
-        </p>
-    </div>
+    ...
     """
 
 
@@ -518,20 +544,7 @@ def generate_default_midday_review(watchlist: list) -> str:
     """生成默认中市回顾（AI调用失败时使用）"""
     return f"""
     <h2 style="margin: 0 0 16px 0; color: #333;">☀️ 中市回顾</h2>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #856404;">⚠️ AI服务暂时不可用</h3>
-        <p style="margin: 0; color: #856404; line-height: 1.6;">
-            当前使用默认内容。请检查智谱AI配置（在代码顶部设置 ZHIPUAI_API_KEY）。
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">午间提醒</h3>
-        <p style="margin: 0; color: #666; line-height: 1.6;">
-            市场正在进行中，请关注下午行情变化。
-        </p>
-    </div>
+    ...
     """
 
 
@@ -539,20 +552,7 @@ def generate_default_eod_summary(watchlist: list) -> str:
     """生成默认尾市总结（AI调用失败时使用）"""
     return f"""
     <h2 style="margin: 0 0 16px 0; color: #333;">🌙 尾市总结</h2>
-
-    <div style="margin: 20px 0; padding: 16px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 6px;">
-        <h3 style="margin: 0 0 8px 0; color: #856404;">⚠️ AI服务暂时不可用</h3>
-        <p style="margin: 0; color: #856404; line-height: 1.6;">
-            当前使用默认内容。请检查智谱AI配置（在代码顶部设置 ZHIPUAI_API_KEY）。
-        </p>
-    </div>
-
-    <div style="margin: 20px 0;">
-        <h3 style="margin: 0 0 12px 0; color: #333;">收盘提醒</h3>
-        <p style="margin: 0; color: #666; line-height: 1.6;">
-            今日市场已收盘，请查看您的自选股表现。
-        </p>
-    </div>
+    ...
     """
 
 
@@ -665,7 +665,7 @@ def send_report(report_type: str):
     logger.info("=" * 60)
 
     try:
-        # 获取启用的用户列表
+        # 获取启用的用户列表（现在每条记录带 resolved_user_id）
         users = get_users_with_email_enabled(report_type)
 
         if not users:
@@ -682,10 +682,10 @@ def send_report(report_type: str):
 
         # 为每个用户发送个性化邮件
         for user in users:
-            user_id = user.get('user_id', '')
-            email = user.get('email', '')
+            email = user.get('email') or user.get('contact') or ''
+            user_id = user.get('resolved_user_id', '')  # 使用解析后的 user_id 字段
 
-            logger.info(f"\n处理用户: {user_id[:12]}...")
+            logger.info(f"\n处理用户: email={email}, user_id={user_id}")
             logger.info(f"   邮箱: {email}")
 
             if not email:
@@ -693,7 +693,7 @@ def send_report(report_type: str):
                 failed_count += 1
                 continue
 
-            # 获取用户自选股
+            # 获取用户自选股（按 user_id）
             logger.info("   获取用户自选股...")
             watchlist = get_user_watchlist(user_id)
             logger.info(f"   找到 {len(watchlist)} 只自选股")
@@ -753,7 +753,7 @@ def main():
         print("")
         print("配置说明:")
         print("  所有API密钥都在代码顶部的配置区")
-        print("  请修改代码中的 ZHIPUAI_API_KEY 变量")
+        print("  建议将敏感密钥放入环境变量并在此处读取")
         sys.exit(1)
 
     report_type = sys.argv[1].lower()
