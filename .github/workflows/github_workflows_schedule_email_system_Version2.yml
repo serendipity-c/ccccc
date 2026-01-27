@@ -75,5 +75,5 @@ jobs:
           # show python version
           python --version
           # Run the script (adjust path if necessary)
-          python "email_system (1).py" "$REPORT_TYPE"
+          python "email_system.py" "$REPORT_TYPE"
         working-directory: ${{ github.workspace }}
