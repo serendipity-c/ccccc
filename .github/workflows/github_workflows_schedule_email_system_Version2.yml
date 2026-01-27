@@ -21,7 +21,6 @@ jobs:
     name: Run scheduled or manual report (Shanghai time aware)
     runs-on: ubuntu-latest
     env:
-      # 明确时区为上海
       TZ: Asia/Shanghai
       # 可选：将敏感密钥注入（推荐将这些值存为 GitHub Secrets 并在此处注入）
       # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -34,7 +33,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.x'
+          python-version: '3.10'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
@@ -42,8 +49,8 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # 根据 email_system.py 中的引用，安装常用��赖（如需其它包可添加）
-            pip install requests zhipuai akshare
+            # 若你忘记提交 requirements.txt，临时安装常用依赖以保证运行
+            pip install requests akshare zhipuai pandas numpy lxml beautifulsoup4 openpyxl
           fi
 
       - name: Run report (manual or scheduled)
