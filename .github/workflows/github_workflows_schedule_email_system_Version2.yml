@@ -1,21 +1,28 @@
-name: Scheduled Email System
+name: Scheduled Stock Email Reports
 
-# 使用多个 cron 条目（注意：GitHub Actions 的 cron 使用 UTC）
 on:
+  # ���个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
+  # - 08:30 Asia/Shanghai => 00:30 UTC
+  # - 12:00 Asia/Shanghai => 04:00 UTC
+  # - 16:30 Asia/Shanghai => 08:30 UTC
   schedule:
-    - cron: '0 1 * * *'   # 对应 北京时间 09:00
-    - cron: '0 4 * * *'   # 对应 北京时间 12:00
-    - cron: '30 8 * * *'  # 对应 北京时间 16:30
-  workflow_dispatch:
-    inputs:
-      task:
-        description: '手动触发要执行的任务 (morning_brief | midday_review | eod_summary)'
-        required: false
-        default: ''
+    - cron: '30 0 * * *'
+    - cron: '0 4 * * *'
+    - cron: '30 8 * * *'
+  workflow_dispatch: {}
 
 jobs:
-  run_email_task:
+  run_report:
+    name: Run scheduled report (detect by Shanghai time)
     runs-on: ubuntu-latest
+    env:
+      # 明确时区为上海，脚本中使用 `date` 时将以此为准
+      TZ: Asia/Shanghai
+      # 可选：如果你修改了 email_system.py 以从环境变量读取密钥，
+      # 你可以在此处将 GitHub Secrets 注入为环境变量，例如：
+      # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,49 +32,30 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install jq (用于解析事件 payload)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
-
-      - name: Install dependencies (if requirements.txt exists)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run task according to trigger
-        env:
-          GITHUB_EVENT_PATH: ${{ github.event_path }}
-        run: |
-          set -e
-          EVENT_FILE="$GITHUB_EVENT_PATH"
-          # 读取 schedule.cron（定时触发）和 inputs.task（手动触发）
-          CRON=$(jq -r '.schedule.cron // empty' "$EVENT_FILE")
-          INPUT_TASK=$(jq -r '.inputs.task // empty' "$EVENT_FILE")
-          echo "Event name: ${{ github.event_name }}"
-          echo "Detected cron: $CRON"
-          echo "Detected input task: $INPUT_TASK"
-
-          if [ -n "$INPUT_TASK" ]; then
-            echo "Manual run: executing task '$INPUT_TASK'"
-            python email_system.py "$INPUT_TASK"
-            exit 0
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            # 根据 email_system.py 中的引用，安装常用依赖（如需其它包可添加）
+            pip install requests zhipuai akshare
           fi
 
-          case "$CRON" in
-            "0 1 * * *")
-              echo "Scheduled run for Beijing 09:00 -> launching morning_brief"
-              python email_system.py morning_brief
-              ;;
-            "0 4 * * *")
-              echo "Scheduled run for Beijing 12:00 -> launching midday_review"
-              python email_system.py midday_review
-              ;;
-            "30 8 * * *")
-              echo "Scheduled run for Beijing 16:30 -> launching eod_summary"
-              python email_system.py eod_summary
-              ;;
-            *)
-              echo "No matching cron. Exiting."
-              ;;
-          esac
+      - name: Run scheduled report (choose by Shanghai time)
+        run: |
+          # 获取北京时间（Asia/Shanghai）
+          CURRENT_TIME=$(TZ=Asia/Shanghai date +'%H:%M')
+          echo "Current Shanghai time: $CURRENT_TIME"
+          if [ "$CURRENT_TIME" = "08:30" ]; then
+            echo "Running morning_brief"
+            python email_system.py morning_brief
+          elif [ "$CURRENT_TIME" = "12:00" ]; then
+            echo "Running midday_review"
+            python email_system.py midday_review
+          elif [ "$CURRENT_TIME" = "16:30" ]; then
+            echo "Running eod_summary"
+            python email_system.py eod_summary
+          else
+            echo "Not a scheduled time. Exiting."
+          fi
