@@ -100,7 +100,7 @@ jobs:
           python --version
 
           # Run the script (update filename/path if necessary)
-          # If your script file name contains spaces (like "email_system (1).py") keep the quotes,
+          # If your script file name contains spaces (like "email_system.py") keep the quotes,
           # but it's recommended to rename it to something without spaces.
-          python "email_system (1).py" "$REPORT_TYPE"
+          python "email_system.py" "$REPORT_TYPE"
         working-directory: ${{ github.workspace }}
