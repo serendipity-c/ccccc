@@ -18,10 +18,14 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-      # 请在仓库 Secrets 中添加这些值，然后取消注释使用
-      # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-      # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      # ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
+      # 将 GitHub Secrets 注入到 runner 环境中（你已经在仓库设置里添加好）
+      RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
+      SMTP_HOST: ${{ secrets.SMTP_HOST }}        # 可选（若你设置了）
+      SMTP_USER: ${{ secrets.SMTP_USER }}        # 可选
+      FROM_EMAIL: ${{ secrets.FROM_EMAIL }}      # 可选
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -43,14 +47,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
-            # 使用国内镜像加速（可根据需要移除 -i）
             pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
           else
             pip install requests pandas numpy lxml beautifulsoup4 openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple
             pip install akshare zhipuai -i https://pypi.tuna.tsinghua.edu.cn/simple || true
           fi
-          echo "=== pip list ==="
-          pip list
+          echo "=== pip list (first 40) ==="
+          pip list | sed -n '1,40p'
           echo "=== pip show akshare ==="
           pip show akshare || echo "akshare not installed"
           echo "=== pip show zhipuai ==="
@@ -86,19 +89,15 @@ jobs:
           if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
             if [ -n "${INPUT_REPORT}" ] && [ "${INPUT_REPORT}" != "by_time" ]; then
               if [ "${INPUT_REPORT}" = "all" ]; then
-                echo "Manual: running all reports sequentially (morning_brief, midday_review, eod_summary)"
                 python email_system.py morning_brief || echo "morning_brief failed"
                 python email_system.py midday_review || echo "midday_review failed"
                 python email_system.py eod_summary || echo "eod_summary failed"
               else
-                echo "Manual: running specified report -> ${INPUT_REPORT}"
                 python email_system.py "${INPUT_REPORT}"
               fi
             else
-              echo "Manual with 'by_time' or empty input -> fall back to time-based dispatch"
               run_by_time
             fi
           else
-            echo "Scheduled event -> run_by_time"
             run_by_time
           fi
