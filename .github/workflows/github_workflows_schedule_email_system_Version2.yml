@@ -1,10 +1,6 @@
 name: Scheduled Stock Email Reports
 
 on:
-  # 三个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
-  # - 08:30 Asia/Shanghai => 00:30 UTC
-  # - 12:00 Asia/Shanghai => 04:00 UTC
-  # - 16:30 Asia/Shanghai => 08:30 UTC
   schedule:
     - cron: '30 0 * * *'
     - cron: '0 4 * * *'
@@ -22,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Asia/Shanghai
-      # 可选：将敏感密钥注入（推荐将这些值存为 GitHub Secrets 并在此处注入）
+      # 请在仓库 Secrets 中添加这些值，然后取消注释使用
       # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       # ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
@@ -43,15 +39,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install dependencies
+      - name: Install dependencies (with mirror, show install logs)
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+            # 使用国内镜像加速（可根据需要移除 -i）
+            pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
           else
-            # 若你忘记提交 requirements.txt，临时安装常用依赖以保证运行
-            pip install requests akshare zhipuai pandas numpy lxml beautifulsoup4 openpyxl
+            pip install requests pandas numpy lxml beautifulsoup4 openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple
+            pip install akshare zhipuai -i https://pypi.tuna.tsinghua.edu.cn/simple || true
           fi
+          echo "=== pip list ==="
+          pip list
+          echo "=== pip show akshare ==="
+          pip show akshare || echo "akshare not installed"
+          echo "=== pip show zhipuai ==="
+          pip show zhipuai || echo "zhipuai not installed"
 
       - name: Run report (manual or scheduled)
         env:
@@ -66,7 +69,6 @@ jobs:
           echo "Current Shanghai time: $CURRENT_TIME"
 
           run_by_time() {
-            # 根据当前上海时间判断要运行的报告
             if [ "$CURRENT_TIME" = "08:30" ]; then
               echo "Detected 08:30 Shanghai time -> running morning_brief"
               python email_system.py morning_brief
@@ -82,7 +84,6 @@ jobs:
           }
 
           if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            # 手动触发
             if [ -n "${INPUT_REPORT}" ] && [ "${INPUT_REPORT}" != "by_time" ]; then
               if [ "${INPUT_REPORT}" = "all" ]; then
                 echo "Manual: running all reports sequentially (morning_brief, midday_review, eod_summary)"
@@ -98,7 +99,6 @@ jobs:
               run_by_time
             fi
           else
-            # 定时触发（来自 schedule）
             echo "Scheduled event -> run_by_time"
             run_by_time
           fi
