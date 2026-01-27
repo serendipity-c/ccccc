@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI驱动邮件发送系统 - 使用 wbsu2003/stock-scanner-mcp 作为信息与 AI 源
-并自动根据用户自选股的 code 推断 market_type（A/HK/US），将代码格式化为 stock-scanner-mcp 期望的形式。
+AI驱动邮件发送系统 - 完整版
+- 使用 wbsu2003/stock-scanner-mcp 作为主要行情与 AI 源（通过 HTTP 接口）
+- 当 stock-scanner-mcp 不可用时回退到智谱 zhipuai（若配置）
+- Supabase 用于读取用户与自选股（user_watchlist 可能只有 name 无 code 的场景）
+- 支持从 name 中提取/解析股票 code 与 market（A/HK/US）
+- 可通过环境变量 STOCK_SCANNER_URL 覆盖 stock-scanner-mcp 地址
 
-注意：所有 URL 与 API keys 已硬编码/或通过环境变量读取。请确保私有管理。
-运行前请确保已安装依赖：requests，并已启动 stock-scanner-mcp 服务（默认 http://localhost:8000）。
+注意：为便于测试与 CI，我保留了一些敏感值的硬编码示例（按你的要求）。在生产环境中强烈建议把它们移到 Secrets / 环境变量。
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from email.utils import formataddr
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
 # -------------------- 全部硬编码配置（按你的要求） --------------------
-# Resend (SMTP)
+# SMTP (Resend 示例)
 RESEND_API_KEY = "re_Nm5shWrw_4Xp8c94P9VFQ12SC7BxEuuv7"
 SMTP_HOST = "smtp.resend.com"
 SMTP_PORT = 587
@@ -36,25 +39,21 @@ FROM_EMAIL = "noreply@chenzhaoqi.asia"
 SUPABASE_URL = "https://ayjxvejaztusajdntbkh.supabase.co"
 SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5anh2ZWphenR1c2FqZG50YmtoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2ODQ0ODAxMSwiZXhwIjoyMDg0MDI0MDExfQ.2Ebe2Ft1gPEfyem0Qie9fGaQ8P3uhJvydGBFyCkvIgE"
 
-# 智谱AI (AI 内容生成) - 仍保留作为回退
+# 智谱AI (回退)
 ZHIPUAI_API_KEY = "21f9ca7cfa0d44f4afeed5ed9d083b23.4zxzk7cZBhr0wnz7"
 
 # stock-scanner-mcp 服务地址（优先使用）
-# 可通过环境变量设置，例如： export STOCK_SCANNER_URL="http://localhost:8000"
 STOCK_SCANNER_URL = os.environ.get("STOCK_SCANNER_URL", "http://localhost:8000").rstrip("/")
 
 # -------------------- 日志配置 --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 # -------------------- 惰性导入状态 --------------------
-_ZHIPUAI_CLS = None    # None = 未知, False = 缺失, class = ZhipuAI
+_ZHIPUAI_CLS = None
 _logged_missing = set()
 
-# -------------------- 惰性导入帮助函数 --------------------
+# -------------------- 帮助：导入 zhipuai --------------------
 def _import_zhipuai_class():
     global _ZHIPUAI_CLS, _logged_missing
     if _ZHIPUAI_CLS is None:
@@ -65,61 +64,27 @@ def _import_zhipuai_class():
         except ImportError:
             _ZHIPUAI_CLS = False
             if "zhipuai" not in _logged_missing:
-                logger.warning("zhipuai 未安装 — AI 内容生成功能将被禁用或降级。")
+                logger.warning("zhipuai 未安装 — AI 回退将不可用。")
                 _logged_missing.add("zhipuai")
         except Exception as e:
             _ZHIPUAI_CLS = False
             logger.warning(f"导入 zhipuai 时出错（已降级）：{e}")
     return _ZHIPUAI_CLS if _ZHIPUAI_CLS else None
 
-# -------------------- stock-scanner-mcp HTTP 客户端封装 --------------------
-def _call_stock_scanner(path: str, params: dict | None = None, timeout: int = 15) -> dict | str | None:
-    """
-    调用 stock-scanner-mcp 的 GET 接口并返回解析后的结果（优先 JSON -> 原始文本）。
-    path 示例: "/stock_ai_analysis", "/stock_price"
-    """
-    base = STOCK_SCANNER_URL
-    if not base:
-        logger.warning("STOCK_SCANNER_URL 未配置，无法调用 stock-scanner-mcp")
-        return None
-    url = f"{base}{path}"
-    try:
-        logger.debug(f"调用 stock-scanner-mcp: GET {url} params={params}")
-        resp = requests.get(url, params=params or {}, timeout=timeout)
-        if resp.status_code != 200:
-            logger.warning(f"stock-scanner-mcp {url} 返回 {resp.status_code}: {resp.text[:200]}")
-            return None
-        # 尝试解析 JSON
-        try:
-            return resp.json()
-        except Exception:
-            return resp.text
-    except RequestsConnectionError as e:
-        logger.warning(f"连接到 stock-scanner-mcp ({url}) 失败: {e}")
-        return None
-    except Exception as e:
-        logger.debug(f"调用 stock-scanner-mcp 时异常: {e}")
-        return None
-
-# -------------------- zhipuai 封装（回退） --------------------
 def get_zhipu_client():
-    """返回 zhipuai 客户端实例，若不可用返回 None"""
     if not ZHIPUAI_API_KEY:
-        logger.warning("未设置 ZHIPUAI_API_KEY；AI 内容生成将被禁用。")
+        logger.warning("未设置 ZHIPUAI_API_KEY；zhipuai 不可用。")
         return None
-
-    ZhipuAI_cls = _import_zhipuai_class()
-    if not ZhipuAI_cls:
+    cls = _import_zhipuai_class()
+    if not cls:
         return None
-
     try:
-        return ZhipuAI_cls(api_key=ZHIPUAI_API_KEY)
+        return cls(api_key=ZHIPUAI_API_KEY)
     except Exception as e:
-        logger.error(f"初始化智谱AI客户端失败: {e}")
+        logger.error(f"初始化 zhipuai 客户端失败: {e}")
         return None
 
 def _call_zhipu(prompt: str) -> str | None:
-    """向 zhipuai 发送 prompt 并返回文本（尽量）"""
     client = get_zhipu_client()
     if not client:
         return None
@@ -149,65 +114,80 @@ def _call_zhipu(prompt: str) -> str | None:
     except Exception:
         return None
 
-# -------------------- 市场类型推断与代码格式化 --------------------
+# -------------------- stock-scanner-mcp HTTP 客户端 --------------------
+def _call_stock_scanner(path: str, params: dict | None = None, timeout: int = 15) -> dict | str | None:
+    """
+    GET 调用 stock-scanner-mcp 并返回 JSON（优先）或文本
+    path: 以 '/' 开头的路径，如 '/stock_ai_analysis'
+    """
+    base = STOCK_SCANNER_URL
+    if not base:
+        logger.warning("STOCK_SCANNER_URL 未配置，无法调用 stock-scanner-mcp")
+        return None
+    url = f"{base}{path}"
+    try:
+        logger.debug(f"GET {url} params={params}")
+        resp = requests.get(url, params=params or {}, timeout=timeout)
+        if resp.status_code != 200:
+            logger.warning(f"stock-scanner-mcp {url} 返回 {resp.status_code}: {resp.text[:200]}")
+            return None
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text
+    except RequestsConnectionError as e:
+        logger.warning(f"连接到 stock-scanner-mcp ({url}) 失败: {e}")
+        return None
+    except Exception as e:
+        logger.debug(f"调用 stock-scanner-mcp 时异常: {e}")
+        return None
+
+# -------------------- 名称到代码解析器（支持只有 name 情况） --------------------
 def infer_market_and_format(raw_code: str) -> tuple[str, str]:
     """
-    根据原始字符串推断 market_type ('A','HK','US') 并格式化 code 为 stock-scanner-mcp 推荐的形式:
-      - A 股: 返回纯数字代码（例如 '600795'），market_type='A'
-      - 港股: 返回不带前缀的代码（例如 '01810' 或 '810' 依赖上游），market_type='HK'
-      - 美股: 返回标准 ticker（例如 'AAPL'），market_type='US'
-    规则（启发式）:
-      - 带前缀 sh/sz => A 股
-      - 带前缀 hk 或 包含 .HK/后缀 => HK
-      - 带前缀 us / gb_ / 全字母短代码 => US
-      - 纯数字且长度==6 => A
-      - 纯数字且长度 in (4,5) => HK
-      - 否则默认尝试作为 US（ticker）
+    推断 market_type ('A','HK','US') 并格式化 code:
+    - '600519' -> ('600519','A')
+    - 'sh600519' -> ('600519','A')
+    - '0700' or '700' -> ('0700','HK') or ('700','HK') (示例)
+    - 'AAPL' -> ('AAPL','US')
     """
     if not raw_code:
         return ("", "A")
     s = str(raw_code).strip()
     s_low = s.lower()
+    s_clean = re.sub(r'[\s\-_\.]', '', s_low)
 
-    # remove common separators
-    s_clean = s.replace(".", "").replace("-", "").replace("_", "").strip()
-
-    # explicit prefixes
-    m = re.match(r'^(sh|sz)(0*\d+)$', s_low)
+    # sh/sz 前缀
+    m = re.match(r'^(sh|sz)(0*\d+)$', s_clean)
     if m:
         return (m.group(2).lstrip("0") or m.group(2), "A")
-    m = re.match(r'^(hk)(0*\d+)$', s_low)
+    # hk 前缀
+    m = re.match(r'^(hk)(0*\d+)$', s_clean)
     if m:
         return (m.group(2).lstrip("0") or m.group(2), "HK")
-
-    # patterns like '600795' -> A (6 digits)
+    # 6 位数字 -> A
     if re.fullmatch(r'\d{6}', s_clean):
         return (s_clean.lstrip("0") or s_clean, "A")
-    # 4-5 digits -> likely HK
+    # 4-5 位数字 -> HK
     if re.fullmatch(r'\d{4,5}', s_clean):
         return (s_clean.lstrip("0") or s_clean, "HK")
-
-    # patterns with .hk suffix (e.g., 0005.hk)
-    m = re.match(r'^(\d{1,6})hk$', s_low)
+    # 后缀 hk
+    m = re.match(r'^(\d{1,6})hk$', s_clean)
     if m:
         return (m.group(1).lstrip("0") or m.group(1), "HK")
-
-    # gb_ or us prefixes
-    if s_low.startswith("us"):
-        return (s[2:].upper(), "US")
-    if s_low.startswith("gb_"):
-        return (s[3:].upper(), "US")
-
-    # if contains letters and no digits (likely ticker)
+    # us 或 gb_ 前缀 -> US
+    if s_clean.startswith("us"):
+        return (s_clean[2:].upper(), "US")
+    if s_clean.startswith("gb"):
+        return (s_clean[2:].upper(), "US")
+    # 纯字母 -> US ticker
     if re.fullmatch(r'[a-zA-Z]{1,6}', s_clean):
         return (s_clean.upper(), "US")
-
-    # fallback: if contains letters mixed with digits (e.g. 'AAPL.US'), extract letters part -> US
+    # 字母前缀
     m = re.match(r'^([A-Za-z]+)', s_clean)
     if m:
         return (m.group(1).upper(), "US")
-
-    # default to A with numeric portion
+    # 提取数字回退
     digits = re.sub(r'\D', '', s_clean)
     if digits:
         if len(digits) == 6:
@@ -215,11 +195,111 @@ def infer_market_and_format(raw_code: str) -> tuple[str, str]:
         if len(digits) in (4,5):
             return (digits, "HK")
         return (digits, "A")
-
-    # final fallback
     return (s_clean.upper(), "US")
 
-# -------------------- Supabase 与自选股读取（包含格式化） --------------------
+def _extract_code_from_name(text: str) -> str | None:
+    if not text:
+        return None
+    t = text.strip()
+    m = re.search(r'[\(\（\[]\s*([0-9A-Za-z]{1,6})\s*[\)\）\]]', t)
+    if m:
+        return m.group(1)
+    m = re.search(r'([0-9A-Za-z]{4,6})(?:\s*$)', t)
+    if m:
+        return m.group(1)
+    m = re.search(r'([0-9]{4,6})\s*[.\-/_]\s*(sh|sz|hk|us)?', t, flags=re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'\b([A-Za-z]{1,6})\b', t)
+    if m and not re.search(r'\d', m.group(1)):
+        return m.group(1)
+    return None
+
+def _try_stock_scanner_search(name: str) -> dict | None:
+    """
+    尝试调用 stock-scanner-mcp 的常见搜索端点以解析 name -> code。
+    若你确切知道搜索端点，请替换 endpoints 列表为实际路径以提高准确性。
+    """
+    if not name or not STOCK_SCANNER_URL:
+        return None
+    endpoints = [
+        "/search_stock", "/stock_search", "/search", "/stock_lookup",
+        "/stock_info", "/suggest", "/mcp/search", "/api/search",
+    ]
+    params_variants = [{"q": name}, {"query": name}, {"keyword": name}, {"stock_name": name}, {"name": name}]
+    headers = {"Accept": "application/json"}
+    for ep in endpoints:
+        url = f"{STOCK_SCANNER_URL.rstrip('/')}{ep}"
+        for params in params_variants:
+            try:
+                resp = requests.get(url, params=params, headers=headers, timeout=6)
+                if resp.status_code != 200:
+                    continue
+                try:
+                    j = resp.json()
+                except Exception:
+                    continue
+                candidates = []
+                if isinstance(j, list):
+                    candidates = j
+                elif isinstance(j, dict):
+                    for k in ("data", "results", "items"):
+                        if k in j and isinstance(j[k], list):
+                            candidates = j[k]
+                            break
+                    if not candidates:
+                        candidates = [j]
+                for item in candidates:
+                    if not isinstance(item, dict):
+                        continue
+                    for key in ("code", "stock_code", "symbol", "ticker", "id"):
+                        if key in item and item[key]:
+                            return item
+                    for v in item.values():
+                        if isinstance(v, str) and re.fullmatch(r'\d{4,6}', v):
+                            return item
+            except Exception:
+                continue
+    return None
+
+def resolve_code_by_name(name: str) -> tuple[str, str] | tuple[None, None]:
+    if not name:
+        return (None, None)
+    direct = _extract_code_from_name(name)
+    if direct:
+        code, market = infer_market_and_format(direct)
+        if code:
+            return (code, market)
+    try:
+        res = _try_stock_scanner_search(name)
+        if res:
+            for key in ("code", "stock_code", "symbol", "ticker", "id"):
+                if key in res and res[key]:
+                    c, m = infer_market_and_format(str(res[key]))
+                    if c:
+                        return (c, m)
+            for v in res.values():
+                if isinstance(v, dict):
+                    for key in ("code", "stock_code", "symbol", "ticker", "id"):
+                        if key in v and v[key]:
+                            c, m = infer_market_and_format(str(v[key]))
+                            if c:
+                                return (c, m)
+    except Exception:
+        pass
+    fallback = _extract_code_from_name(name)
+    if fallback:
+        c, m = infer_market_and_format(fallback)
+        if c:
+            return (c, m)
+    letters = re.findall(r'[A-Za-z]{1,6}', name)
+    if letters:
+        c, m = infer_market_and_format(letters[0])
+        if c:
+            return (c, m)
+    return (None, None)
+
+# -------------------- Supabase 帮助函数 --------------------
 def _supabase_headers():
     return {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -231,7 +311,6 @@ def get_user_id_by_email(email: str) -> str | None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.warning("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法解析 user_id。")
         return None
-
     headers = _supabase_headers()
     candidate_tables = ["users", "user_profiles", "profiles"]
     for table in candidate_tables:
@@ -242,7 +321,6 @@ def get_user_id_by_email(email: str) -> str | None:
         except Exception as e:
             logger.debug(f"请求 {url} 失败: {e}")
             continue
-
         if resp.status_code == 200:
             try:
                 rows = resp.json()
@@ -259,6 +337,11 @@ def get_user_id_by_email(email: str) -> str | None:
                 if v:
                     logger.info(f"通过表 {table} 找到可能的 user_id 值={v} for email={email}")
                     return str(v)
+        elif resp.status_code == 404:
+            logger.debug(f"表 {table} 不存在 (404)，跳过")
+            continue
+        else:
+            logger.debug(f"查询 {table} 返回 {resp.status_code}: {resp.text}")
     logger.warning(f"未能通过常见表解析 email={email} 对应的 user_id")
     return None
 
@@ -266,32 +349,23 @@ def get_users_with_email_enabled(report_type: str = "morning_brief") -> list[dic
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.error("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法查询用户列表。")
         return []
-
     headers = _supabase_headers()
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/user_email_preferences"
-    params = {
-        "select": "*",
-        "enabled": "eq.true",
-        f"{report_type}->>enabled": "eq.true"
-    }
-
+    params = {"select": "*", "enabled": "eq.true", f"{report_type}->>enabled": "eq.true"}
     logger.info(f"查询启用了 {report_type} 的用户...")
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
     except Exception as e:
         logger.error(f"请求 Supabase 失败: {e}")
         return []
-
     if resp.status_code != 200:
         logger.error(f"查询 user_email_preferences 失败: {resp.status_code} - {resp.text}")
         return []
-
     try:
         records = resp.json()
     except Exception as e:
         logger.error(f"解析 Supabase 响应失败: {e}")
         return []
-
     enhanced = []
     for rec in records:
         email = rec.get("email") or rec.get("contact") or ""
@@ -304,68 +378,52 @@ def get_users_with_email_enabled(report_type: str = "morning_brief") -> list[dic
 
 def get_user_watchlist(user_id: str) -> list[dict]:
     """
-    从 Supabase 获取用户自选股，并为每条记录推断 market_type 与格式化 code。
-    返回项格式：{"name": ..., "raw_code": ..., "code": formatted_code, "market": "A"/"HK"/"US"}
+    从 Supabase 获取用户自选股；如果只有 name 则解析 code 与 market。
+    返回每条记录：{"name","raw_code","code","market"}
     """
     if not user_id:
         return []
-
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.error("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法查询自选股。")
         return []
-
     headers = _supabase_headers()
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/user_watchlist"
     params = {"select": "name,code", "user_id": f"eq.{user_id}"}
-
     logger.info(f"请求 Supabase: GET {url} params={params}")
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
     except Exception as e:
         logger.error(f"请求 user_watchlist 失败: {e}")
         return []
-
     if resp.status_code != 200:
         logger.error(f"查询自选股失败: {resp.status_code} - {resp.text}")
         return []
-
     try:
         rows = resp.json()
     except Exception as e:
         logger.error(f"解析自选股响应失败: {e}")
         return []
-
     normalized = []
     for row in rows:
         name = row.get("name") or row.get("stock_name") or ""
         raw_code = row.get("code") or row.get("symbol") or ""
         name = str(name).strip() if name is not None else ""
         raw_code = str(raw_code).strip() if raw_code is not None else ""
-
-        formatted_code, market = infer_market_and_format(raw_code)
-        # If no code in DB but name looks like a ticker, try to infer from name
-        if not formatted_code and name:
-            f2, m2 = infer_market_and_format(name)
-            if f2:
-                formatted_code, market = f2, m2
-
+        if raw_code:
+            formatted_code, market = infer_market_and_format(raw_code)
+        else:
+            formatted_code, market = resolve_code_by_name(name)
         normalized.append({
-            "name": name or formatted_code,
+            "name": name or formatted_code or raw_code,
             "raw_code": raw_code,
-            "code": formatted_code,
-            "market": market
+            "code": formatted_code or "",
+            "market": market or "A"
         })
     logger.info(f"   用户 {user_id} 有 {len(normalized)} 条自选股（含格式化 code 与 market）")
     return normalized
 
 # -------------------- 使用 stock-scanner-mcp 的行情/AI 封装 --------------------
 def get_stock_quote(stock_code: str, market_type: str = "A") -> dict | None:
-    """
-    使用 stock-scanner-mcp /stock_price 获取单只股票行情。
-    stock_code: formatted code (e.g., '600795' for A, '01810' for HK, 'AAPL' for US)
-    market_type: 'A' / 'HK' / 'US'
-    返回统一结构：{code,name,price,change,volume,high,low,open,yesterday_close}
-    """
     if not stock_code:
         return None
     params = {"stock_code": stock_code, "market_type": market_type}
@@ -373,10 +431,7 @@ def get_stock_quote(stock_code: str, market_type: str = "A") -> dict | None:
     if not res:
         return None
     if isinstance(res, dict):
-        if "data" in res and isinstance(res["data"], dict):
-            src = res["data"]
-        else:
-            src = res
+        src = res["data"] if "data" in res and isinstance(res["data"], dict) else res
         mapped = {
             "code": src.get("code") or stock_code,
             "name": src.get("name") or src.get("stock_name") or "",
@@ -393,14 +448,7 @@ def get_stock_quote(stock_code: str, market_type: str = "A") -> dict | None:
     return None
 
 def get_market_index() -> dict:
-    """
-    使用 stock-scanner-mcp 获取主要指数（上证、深证、创业板）。
-    """
-    indices_codes = {
-        "sh": ("000001", "A"),
-        "sz": ("399001", "A"),
-        "cyb": ("399006", "A"),
-    }
+    indices_codes = {"sh": ("000001", "A"), "sz": ("399001", "A"), "cyb": ("399006", "A")}
     out = {}
     for k, (code, mt) in indices_codes.items():
         candidates = [code, f"sh{code}", f"sz{code}"]
@@ -415,9 +463,6 @@ def get_market_index() -> dict:
     return out
 
 def get_ai_analysis_for_stock(stock_code: str, market_type: str = "A") -> str | None:
-    """
-    使用 stock-scanner-mcp 的 /stock_ai_analysis 获取单支股票的 AI 分析（返回文本或 HTML）。
-    """
     if not stock_code:
         return None
     params = {"stock_code": stock_code, "market_type": market_type}
@@ -433,11 +478,8 @@ def get_ai_analysis_for_stock(stock_code: str, market_type: str = "A") -> str | 
         return str(res)
     return str(res)
 
-# -------------------- AI 内容生成统一入口（优先使用 stock-scanner-mcp, 再 zhipuai） --------------------
+# -------------------- AI 内容生成（优先 stock-scanner-mcp，再 zhipuai 回退） --------------------
 def generate_ai_content_for_watchlist(watchlist: list) -> str:
-    """
-    为一组自选股生成聚合 AI 内容：使用 stock-scanner-mcp 的 /stock_ai_analysis（按 stock 的 market 调用）。
-    """
     parts = []
     for s in (watchlist or [])[:8]:
         code = s.get("code", "")
@@ -450,7 +492,6 @@ def generate_ai_content_for_watchlist(watchlist: list) -> str:
         if ai_text:
             parts.append(f"<h3>{name} ({code} - {market})</h3><div>{ai_text}</div>")
         else:
-            # 回退到 zhipuai（若可用）
             prompt = f"请对股票 {name} ({code}, 市场 {market}) 做简短分析，包含趋势与操作建议（中文，约100字）。"
             z = _call_zhipu(prompt)
             if z:
@@ -461,13 +502,12 @@ def generate_ai_content_for_watchlist(watchlist: list) -> str:
         return "<p>暂无可用自选股分析。</p>"
     return "\n".join(parts)
 
-# -------------------- 报告生成（基于 stock-scanner-mcp） --------------------
+# -------------------- 报告生成 --------------------
 def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
-    logger.info(f"为用户 {str(user_id)[:12]}... 生成早市简报（使用 stock-scanner-mcp）")
+    logger.info(f"为用户 {str(user_id)[:12]}... 生成早市简报")
     try:
         indices = get_market_index()
         stock_context = generate_ai_content_for_watchlist(watchlist)
-
         header = "<p>以下内容来自 stock-scanner-mcp 的 AI 分析模块（按自选股汇总）。</p>"
         indices_html = ""
         if indices:
@@ -479,7 +519,6 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
                     change = 0
                 indices_html += f"<li>{idx.get('name')}: {idx.get('price')} ({('+' if change>0 else '')}{change})</li>"
             indices_html += "</ul>"
-
         content = f"""
         <h2>早市快讯</h2>
         {header}
@@ -495,7 +534,7 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
         return generate_default_morning_brief(watchlist)
 
 def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
-    logger.info(f"为用户 {str(user_id)[:12]}... 生成中市回顾（使用 stock-scanner-mcp）")
+    logger.info(f"为用户 {str(user_id)[:12]}... 生成中市回顾")
     try:
         indices = get_market_index()
         stock_quotes = []
@@ -515,7 +554,6 @@ def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
                 change = 0
             market_context += f"<li>{idx.get('name')}: {idx.get('price')} ({('+' if change>0 else '')}{change}%)</li>"
         market_context += "</ul>"
-
         stocks_context = "<ul>"
         for q in stock_quotes:
             try:
@@ -524,9 +562,7 @@ def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
                 change = 0
             stocks_context += f"<li>{q.get('name')} ({q.get('code')}): {q.get('price')} ({('+' if change>0 else '')}{change}%)</li>"
         stocks_context += "</ul>"
-
         ai_block = generate_ai_content_for_watchlist(watchlist[:5])
-
         content = f"""
         <h2>中市回顾</h2>
         <h3>上午市场表现</h3>
@@ -542,7 +578,7 @@ def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
         return generate_default_midday_review(watchlist)
 
 def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
-    logger.info(f"为用户 {str(user_id)[:12]}... 生成尾市总结（使用 stock-scanner-mcp）")
+    logger.info(f"为用户 {str(user_id)[:12]}... 生成尾市总结")
     try:
         indices = get_market_index()
         stock_quotes = []
@@ -554,7 +590,6 @@ def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
             q = get_stock_quote(code, market)
             if q:
                 stock_quotes.append(q)
-
         market_context = "<ul>"
         for key, idx in indices.items():
             try:
@@ -563,23 +598,18 @@ def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
                 change = 0
             market_context += f"<li>{idx.get('name')}: {idx.get('price')} ({('+' if change>0 else '')}{change}%)</li>"
         market_context += "</ul>"
-
         sorted_by_change = sorted(stock_quotes, key=lambda x: float(x.get("change") or 0), reverse=True)
         top_gainers = sorted_by_change[:3]
         top_losers = sorted_by_change[-3:]
-
         gain_html = "<ul>"
         for q in top_gainers:
             gain_html += f"<li>{q.get('name')} ({q.get('code')}): {q.get('price')} ({q.get('change')}%)</li>"
         gain_html += "</ul>"
-
         lose_html = "<ul>"
         for q in top_losers:
             lose_html += f"<li>{q.get('name')} ({q.get('code')}): {q.get('price')} ({q.get('change')}%)</li>"
         lose_html += "</ul>"
-
         ai_block = generate_ai_content_for_watchlist(watchlist[:5])
-
         content = f"""
         <h2>尾市总结</h2>
         <h3>今日收盘要点</h3>
@@ -599,69 +629,45 @@ def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
 # -------------------- 默认回退内容 --------------------
 def generate_default_morning_brief(watchlist: list) -> str:
     stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
-    return f"""
-    <h2>📅 早市简报</h2>
-    <p>当前 AI 服务或行情服务不可用。使用默认回退内容。</p>
-    <p>您的自选股：{stock_list}</p>
-    <p>提示：请关注今日开盘及自选股表现。</p>
-    """
+    return f"""<h2>📅 早市简报</h2><p>当前 AI/行情服务不可用，采用默认回退。</p><p>您的自选股：{stock_list}</p>"""
 
 def generate_default_midday_review(watchlist: list) -> str:
     stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
-    return f"""
-    <h2>☀️ 中市回顾</h2>
-    <p>当前 AI 服务或行情服务不可用。使用默认回退内容。</p>
-    <p>您的自选股：{stock_list}</p>
-    <p>提示：请关注午后走势。</p>
-    """
+    return f"""<h2>☀️ 中市回顾</h2><p>当前 AI/行情服务不可用，采用默认回退。</p><p>您的自选股：{stock_list}</p>"""
 
 def generate_default_eod_summary(watchlist: list) -> str:
     stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
-    return f"""
-    <h2>🌙 尾市总结</h2>
-    <p>当前 AI 服务或行情服务不可用。使用默认回退内容。</p>
-    <p>您的自选股：{stock_list}</p>
-    <p>提示：请查看自选股今日表现并做好盘后总结。</p>
-    """
+    return f"""<h2>🌙 尾市总结</h2><p>当前 AI/行情服务不可用，采用默认回退。</p><p>您的自选股：{stock_list}</p>"""
 
-# -------------------- 邮件创建与发送（使用 SMTP） --------------------
+# -------------------- 邮件创建与发送 --------------------
 def create_simple_html(title: str, content: str) -> str:
-    return f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title></head>
-<body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;">
-  <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f4f4;">
-    <tr><td style="padding:40px 0;">
-      <table width="600" align="center" cellpadding="0" cellspacing="0" role="presentation" style="background:#fff;border-radius:8px;">
-        <tr><td style="padding:24px;border-bottom:2px solid #667eea;"><h1 style="margin:0;font-size:20px;color:#333;">{title}</h1></td></tr>
-        <tr><td style="padding:24px;">{content}</td></tr>
-        <tr><td style="padding:12px;border-top:1px solid #eee;text-align:center;color:#999;font-size:12px;">此邮件由 Portfolio Guardian 自动发送，请勿直接回复</td></tr>
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title></head>
+    <body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;">
+      <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="background:#f4f4f4;">
+        <tr><td style="padding:40px 0;">
+          <table width="600" align="center" cellpadding="0" cellspacing="0" role="presentation" style="background:#fff;border-radius:8px;">
+            <tr><td style="padding:24px;border-bottom:2px solid #667eea;"><h1 style="margin:0;font-size:20px;color:#333;">{title}</h1></td></tr>
+            <tr><td style="padding:24px;">{content}</td></tr>
+            <tr><td style="padding:12px;border-top:1px solid #eee;text-align:center;color:#999;font-size:12px;">此邮件由 Portfolio Guardian 自动发送，请勿直接回复</td></tr>
+          </table>
+        </td></tr>
       </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    </body></html>"""
 
 def send_email(to_email: str, subject: str, html_content: str) -> bool:
-    """通过 SMTP 发送邮件（使用硬编码的 RESEND_API_KEY 作为密码）"""
     try:
-        logger.info(f"准备发送邮件到: {to_email}")
-        logger.info(f"   主题: {subject}")
-
+        logger.info(f"准备发送邮件到: {to_email} 主题: {subject}")
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = formataddr((FROM_NAME, FROM_EMAIL))
         msg["To"] = to_email
-
         html_part = MIMEText(html_content, "html", "utf-8")
         msg.attach(html_part)
-
-        logger.info(f"   连接到 SMTP 服务器: {SMTP_HOST}:{SMTP_PORT}")
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.starttls()
-            logger.info("   TLS 已启用")
+            logger.info("SMTP TLS 已启用")
             server.login(SMTP_USER, RESEND_API_KEY)
-            logger.info("   SMTP 登录成功")
+            logger.info("SMTP 登录成功")
             server.send_message(msg)
             logger.info(f"邮件发送成功到 {to_email}")
             return True
@@ -675,42 +681,30 @@ def send_email(to_email: str, subject: str, html_content: str) -> bool:
         logger.error(f"发送邮件时出错: {e}")
         return False
 
-# -------------------- 主调度与报告发送 --------------------
+# -------------------- 主调度 --------------------
 def send_report(report_type: str):
     logger.info("=" * 60)
     report_names = {"morning_brief": "早市简报", "midday_review": "中市回顾", "eod_summary": "尾市总结"}
     title_prefixes = {"morning_brief": "📅 早市简报", "midday_review": "☀️ 中市回顾", "eod_summary": "🌙 尾市总结"}
-
     logger.info(f"开始执行：{report_names.get(report_type, report_type)}")
-    logger.info("=" * 60)
-
     users = get_users_with_email_enabled(report_type)
     if not users:
         logger.warning("没有启用的用户，任务结束")
         return
-
     logger.info(f"找到 {len(users)} 个启用的用户")
     success_count = 0
     failed_count = 0
     title_prefix = title_prefixes.get(report_type, "📊 股市报告")
-
     for user in users:
         email = user.get("email") or user.get("contact") or ""
         user_id = user.get("resolved_user_id", "")
-
-        logger.info(f"\n处理用户: email={email}, user_id={user_id}")
-        logger.info(f"   邮箱: {email}")
-
+        logger.info(f"处理用户: email={email}, user_id={user_id}")
         if not email:
-            logger.warning("   用户没有设置邮箱，跳过")
+            logger.warning("用户没有设置邮箱，跳过")
             failed_count += 1
             continue
-
-        logger.info("   获取用户自选股...")
         watchlist = get_user_watchlist(user_id)
-        logger.info(f"   找到 {len(watchlist)} 只自选股")
-
-        logger.info("   使用 AI 生成个性化内容...")
+        logger.info(f"找到 {len(watchlist)} 只自选股")
         if report_type == "morning_brief":
             content = generate_morning_brief_ai(user_id, watchlist)
         elif report_type == "midday_review":
@@ -718,44 +712,33 @@ def send_report(report_type: str):
         elif report_type == "eod_summary":
             content = generate_eod_summary_ai(user_id, watchlist)
         else:
-            logger.error(f"未知的报告类型: {report_type}")
+            logger.error(f"未知报告类型: {report_type}")
             failed_count += 1
             continue
-
         html = create_simple_html(title_prefix, content)
         today = datetime.now().strftime("%Y年%m月%d日 %A")
         subject = f"{title_prefix} - {today}"
-
         if send_email(email, subject, html):
             success_count += 1
         else:
             failed_count += 1
-
-    logger.info("\n" + "=" * 60)
+    logger.info("=" * 60)
     logger.info(f"任务完成: 成功 {success_count}, 失败 {failed_count}")
     logger.info("=" * 60)
 
-# -------------------- CLI 主函数 --------------------
+# -------------------- CLI --------------------
 def main():
     if len(sys.argv) < 2:
         print("用法: python email_system.py <report_type>")
-        print("")
-        print("报告类型:")
-        print("  morning_brief  - 早市简报 (08:30)")
-        print("  midday_review  - 中市回顾 (12:00)")
-        print("  eod_summary    - 尾市总结 (16:30)")
-        print("")
-        print("示例:")
-        print("  STOCK_SCANNER_URL=http://localhost:8000 python email_system.py morning_brief")
+        print("  report_type: morning_brief | midday_review | eod_summary")
+        print("示例: STOCK_SCANNER_URL=http://localhost:8000 python email_system.py morning_brief")
         sys.exit(1)
-
     report_type = sys.argv[1].lower()
     valid_types = ["morning_brief", "midday_review", "eod_summary"]
     if report_type not in valid_types:
         logger.error(f"无效的报告类型: {report_type}")
         logger.error(f"有效类型: {', '.join(valid_types)}")
         sys.exit(1)
-
     send_report(report_type)
 
 if __name__ == "__main__":
