@@ -1,108 +1,79 @@
-name: Scheduled Stock Email Reports
-
+# Scheduled workflow to run the email_system script at China time:
+#  - 09:00 Asia/Shanghai -> morning_brief
+#  - 12:00 Asia/Shanghai -> midday_review
+#  - 16:30 Asia/Shanghai -> eod_summary
+#
+# Notes:
+#  - GitHub Actions cron expressions use UTC. This workflow sets three UTC cron entries
+#    that correspond to the above Asia/Shanghai times: 09:00 (UTC+8) -> 01:00 UTC, etc.
+#  - The job determines the local Asia/Shanghai time at runtime and picks the report type.
+#  - Configure STOCK_SCANNER_URL (e.g. https://your-host:8000) as a repository secret for safety.
+#  - If your script filename differs, update the path in the final run step.
 on:
-  # 三个 cron 条目（按 UTC 时间设置以匹配北京时间 Asia/Shanghai）
-  # - 08:30 Asia/Shanghai => 00:30 UTC
-  # - 12:00 Asia/Shanghai => 04:00 UTC
-  # - 16:30 Asia/Shanghai => 08:30 UTC
   schedule:
-    - cron: '30 0 * * *'
-    - cron: '0 4 * * *'
-    - cron: '30 8 * * *'
-  workflow_dispatch:
-    inputs:
-      report_type:
-        description: '手动运行的报告类型：morning_brief | midday_review | eod_summary | all | by_time（按当前上海时间判断），默认 by_time'
-        required: false
-        default: 'by_time'
+    - cron: '0 1 * * *'    # 09:00 Asia/Shanghai
+    - cron: '0 4 * * *'    # 12:00 Asia/Shanghai
+    - cron: '30 8 * * *'   # 16:30 Asia/Shanghai
+  workflow_dispatch: {}
+
+name: Send Stock Reports
+
+permissions:
+  contents: read
 
 jobs:
-  run_report:
-    name: Run scheduled or manual report (Shanghai time aware)
+  send_reports:
     runs-on: ubuntu-latest
+    # Provide the stock-scanner-mcp base URL via repository secret STOCK_SCANNER_URL
+    # (e.g. http://localhost:8000 or https://your-host:8000)
     env:
-      TZ: Asia/Shanghai
-      # NOTE: You requested all keys hardcoded in email_system.py, so no secrets are injected here.
-      # Warning: hardcoding secrets in source is insecure. Consider migrating to GitHub Secrets later.
+      STOCK_SCANNER_URL: ${{ secrets.STOCK_SCANNER_URL }}
+      # Optionally add other secrets here if you modify the script to read them:
+      # SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      # SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # SMTP_HOST: ${{ secrets.SMTP_HOST }}
+      # SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      # SMTP_USER: ${{ secrets.SMTP_USER }}
+      # RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+      # ZHIPUAI_API_KEY: ${{ secrets.ZHIPUAI_API_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies (use requirements.txt if present)
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            # 使用国内镜像以提高稳定性（可移除 -i 参数）
-            pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-          else
-            # 临时安装常见依赖，确保脚本可以运行
-            pip install requests akshare zhipuai pandas numpy lxml beautifulsoup4 openpyxl -i https://pypi.tuna.tsinghua.edu.cn/simple || true
-          fi
-          echo "=== pip list (first 40) ==="
-          pip list | sed -n '1,40p'
-          echo "=== pip show akshare ==="
-          pip show akshare || echo "akshare not installed"
-          echo "=== pip show zhipuai ==="
-          pip show zhipuai || echo "zhipuai not installed"
+          # install minimal dependency used by script; add more if needed
+          pip install requests
 
-      - name: Run report (manual or scheduled)
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_REPORT: ${{ github.event.inputs.report_type }}
+      - name: Determine report type (Asia/Shanghai) and run email script
+        # The script filename here is "email_system (1).py" as you provided earlier.
+        # If your file name/path differs, update the command below.
         run: |
-          set -euo pipefail || true
-
-          CURRENT_TIME=$(TZ=Asia/Shanghai date +'%H:%M')
-          echo "Event: $EVENT_NAME"
-          echo "Input report_type: '${INPUT_REPORT}'"
-          echo "Current Shanghai time: $CURRENT_TIME"
-
-          run_by_time() {
-            if [ "$CURRENT_TIME" = "08:30" ]; then
-              echo "Detected 08:30 Shanghai time -> running morning_brief"
-              python email_system.py morning_brief
-            elif [ "$CURRENT_TIME" = "12:00" ]; then
-              echo "Detected 12:00 Shanghai time -> running midday_review"
-              python email_system.py midday_review
-            elif [ "$CURRENT_TIME" = "16:30" ]; then
-              echo "Detected 16:30 Shanghai time -> running eod_summary"
-              python email_system.py eod_summary
-            else
-              echo "Not a scheduled time (08:30/12:00/16:30). Exiting without running reports."
-            fi
-          }
-
-          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
-            # 手动触发
-            if [ -n "${INPUT_REPORT}" ] && [ "${INPUT_REPORT}" != "by_time" ]; then
-              if [ "${INPUT_REPORT}" = "all" ]; then
-                echo "Manual: running all reports sequentially (morning_brief, midday_review, eod_summary)"
-                python email_system.py morning_brief || echo "morning_brief failed"
-                python email_system.py midday_review || echo "midday_review failed"
-                python email_system.py eod_summary || echo "eod_summary failed"
-              else
-                echo "Manual: running specified report -> ${INPUT_REPORT}"
-                python email_system.py "${INPUT_REPORT}"
-              fi
-            else
-              echo "Manual with 'by_time' or empty input -> fall back to time-based dispatch"
-              run_by_time
-            fi
+          echo "STOCK_SCANNER_URL=${STOCK_SCANNER_URL}"
+          echo "Current UTC time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          # compute Asia/Shanghai local time
+          now=$(TZ=Asia/Shanghai date +'%H:%M')
+          echo "Asia/Shanghai local time: $now"
+          if [ "$now" = "09:00" ]; then
+            REPORT_TYPE="morning_brief"
+          elif [ "$now" = "12:00" ]; then
+            REPORT_TYPE="midday_review"
+          elif [ "$now" = "16:30" ]; then
+            REPORT_TYPE="eod_summary"
           else
-            # 定时触发（来自 schedule）
-            echo "Scheduled event -> run_by_time"
-            run_by_time
+            echo "Schedule triggered at unexpected local time ($now). Exiting without sending."
+            # Exit with success so this scheduled run does not mark as failed
+            exit 0
           fi
+          echo "Selected report type: $REPORT_TYPE"
+          # show python version
+          python --version
+          # Run the script (adjust path if necessary)
+          python "email_system (1).py" "$REPORT_TYPE"
+        working-directory: ${{ github.workspace }}
