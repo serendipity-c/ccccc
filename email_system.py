@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI驱动邮件发送系统 - 完整版
-- 使用 wbsu2003/stock-scanner-mcp 作为主要行情与 AI 源（通过 HTTP 接口）
-- 当 stock-scanner-mcp 不可用时回退到智谱 zhipuai（若配置）
-- Supabase 用于读取用户与自选股（user_watchlist 可能只有 name 无 code 的场景）
-- 支持从 name 中提取/解析股票 code 与 market（A/HK/US）
-- 可通过环境变量 STOCK_SCANNER_URL 覆盖 stock-scanner-mcp 地址
-
-注意：为便于测试与 CI，我保留了一些敏感值的硬编码示例（按你的要求）。在生产环境中强烈建议把它们移到 Secrets / 环境变量。
+AI 驱动邮件发送系统 - 使用 DR-lin-eng/stock-scanner 作为唯一信息与 AI 源
+说明：
+- 本版将所有行情与 AI 分析调用改为请求 DR-lin-eng/stock-scanner 的 Web API（见仓库 web_app.py / README）。
+- 主要使用的 HTTP 接口（需在部署的 stock-scanner 服务中存在）：
+    POST {DR_STOCK_SCANNER_URL}/api/analyze         -> 单支股票分析（返回 price_info, ai_analysis, 等）
+    POST {DR_STOCK_SCANNER_URL}/api/analyze_stream  -> （可选）流式分析
+    POST {DR_STOCK_SCANNER_URL}/api/batch-analyze   -> 批量分析（可选）
+  如果你的部署使用不同路径，请告知我以便调整。
+- 配置：通过环境变量 DR_STOCK_SCANNER_URL 设置服务地址，例如:
+    export DR_STOCK_SCANNER_URL="http://localhost:8443"
+- 回退：若 DR 服务不可用，脚本会尝试使用内置 zhipuai（若配置）作为 AI 回退；行情/价格若不可用则使用默认回退文案。
 """
 
 from __future__ import annotations
@@ -18,16 +21,16 @@ import re
 import sys
 import time
 import smtplib
-import requests
+import json
 import logging
+import requests
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
-# -------------------- 全部硬编码配置（按你的要求） --------------------
-# SMTP (Resend 示例)
+# -------------------- 配置（可移到环境变量或 Secrets） --------------------
 RESEND_API_KEY = "re_Nm5shWrw_4Xp8c94P9VFQ12SC7BxEuuv7"
 SMTP_HOST = "smtp.resend.com"
 SMTP_PORT = 587
@@ -35,17 +38,15 @@ SMTP_USER = "resend"
 FROM_NAME = "Portfolio Guardian"
 FROM_EMAIL = "noreply@chenzhaoqi.asia"
 
-# Supabase (数据库)
 SUPABASE_URL = "https://ayjxvejaztusajdntbkh.supabase.co"
 SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5anh2ZWphenR1c2FqZG50YmtoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2ODQ0ODAxMSwiZXhwIjoyMDg0MDI0MDExfQ.2Ebe2Ft1gPEfyem0Qie9fGaQ8P3uhJvydGBFyCkvIgE"
 
-# 智谱AI (回退)
 ZHIPUAI_API_KEY = "21f9ca7cfa0d44f4afeed5ed9d083b23.4zxzk7cZBhr0wnz7"
 
-# stock-scanner-mcp 服务地址（优先使用）
-STOCK_SCANNER_URL = os.environ.get("STOCK_SCANNER_URL", "http://localhost:8000").rstrip("/")
+# DR-lin-eng/stock-scanner 服务地址（优先使用）
+DR_STOCK_SCANNER_URL = os.environ.get("DR_STOCK_SCANNER_URL", "").rstrip("/")
 
-# -------------------- 日志配置 --------------------
+# -------------------- 日志 --------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 _ZHIPUAI_CLS = None
 _logged_missing = set()
 
-# -------------------- 帮助：导入 zhipuai --------------------
+# -------------------- zhipuai client (回退) --------------------
 def _import_zhipuai_class():
     global _ZHIPUAI_CLS, _logged_missing
     if _ZHIPUAI_CLS is None:
@@ -64,16 +65,15 @@ def _import_zhipuai_class():
         except ImportError:
             _ZHIPUAI_CLS = False
             if "zhipuai" not in _logged_missing:
-                logger.warning("zhipuai 未安装 — AI 回退将不可用。")
+                logger.warning("zhipuai 未安装 — AI 回退不可用。")
                 _logged_missing.add("zhipuai")
         except Exception as e:
             _ZHIPUAI_CLS = False
-            logger.warning(f"导入 zhipuai 时出错（已降级）：{e}")
+            logger.warning(f"导入 zhipuai 时出错：{e}")
     return _ZHIPUAI_CLS if _ZHIPUAI_CLS else None
 
 def get_zhipu_client():
     if not ZHIPUAI_API_KEY:
-        logger.warning("未设置 ZHIPUAI_API_KEY；zhipuai 不可用。")
         return None
     cls = _import_zhipuai_class()
     if not cls:
@@ -81,10 +81,10 @@ def get_zhipu_client():
     try:
         return cls(api_key=ZHIPUAI_API_KEY)
     except Exception as e:
-        logger.error(f"初始化 zhipuai 客户端失败: {e}")
+        logger.error(f"初始化 zhipuai 失败: {e}")
         return None
 
-def _call_zhipu(prompt: str) -> str | None:
+def call_zhipu(prompt: str) -> str | None:
     client = get_zhipu_client()
     if not client:
         return None
@@ -101,7 +101,6 @@ def _call_zhipu(prompt: str) -> str | None:
         except Exception as e:
             logger.error(f"调用 zhipuai 失败: {e}")
             return None
-
     try:
         if hasattr(response, "choices"):
             return getattr(response.choices[0].message, "content", None) or getattr(response.choices[0], "text", None)
@@ -114,80 +113,69 @@ def _call_zhipu(prompt: str) -> str | None:
     except Exception:
         return None
 
-# -------------------- stock-scanner-mcp HTTP 客户端 --------------------
-def _call_stock_scanner(path: str, params: dict | None = None, timeout: int = 15) -> dict | str | None:
+# -------------------- DR stock-scanner HTTP 客户端 --------------------
+def _call_dr_scanner(path: str, payload: dict | None = None, timeout: int = 20) -> dict | str | None:
     """
-    GET 调用 stock-scanner-mcp 并返回 JSON（优先）或文本
-    path: 以 '/' 开头的路径，如 '/stock_ai_analysis'
+    对 DR-lin-eng/stock-scanner 的 HTTP 接口进行调用。
+    常用 endpoints:
+      POST {DR_STOCK_SCANNER_URL}/api/analyze  -> body: {"stock_code": "..."}
+      POST {DR_STOCK_SCANNER_URL}/api/analyze_stream -> body: {"stock_code": "..."} (stream)
+      POST {DR_STOCK_SCANNER_URL}/api/batch-analyze -> body: {"stock_list": [...]}
+    返回 JSON（优先）或文本。
     """
-    base = STOCK_SCANNER_URL
-    if not base:
-        logger.warning("STOCK_SCANNER_URL 未配置，无法调用 stock-scanner-mcp")
+    if not DR_STOCK_SCANNER_URL:
+        logger.warning("DR_STOCK_SCANNER_URL 未配置，无法调用 DR stock-scanner 服务")
         return None
-    url = f"{base}{path}"
+
+    url = f"{DR_STOCK_SCANNER_URL}{path}"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     try:
-        logger.debug(f"GET {url} params={params}")
-        resp = requests.get(url, params=params or {}, timeout=timeout)
-        if resp.status_code != 200:
-            logger.warning(f"stock-scanner-mcp {url} 返回 {resp.status_code}: {resp.text[:200]}")
+        logger.debug(f"POST {url} payload={payload}")
+        resp = requests.post(url, json=payload or {}, headers=headers, timeout=timeout)
+        if resp.status_code not in (200, 201):
+            logger.warning(f"DR scanner {url} 返回 {resp.status_code}: {resp.text[:300]}")
             return None
         try:
             return resp.json()
         except Exception:
             return resp.text
     except RequestsConnectionError as e:
-        logger.warning(f"连接到 stock-scanner-mcp ({url}) 失败: {e}")
+        logger.warning(f"无法连接 DR scanner ({url}): {e}")
         return None
     except Exception as e:
-        logger.debug(f"调用 stock-scanner-mcp 时异常: {e}")
+        logger.debug(f"���用 DR scanner 出错: {e}")
         return None
 
-# -------------------- 名称到代码解析器（支持只有 name 情况） --------------------
+# -------------------- 名称到代码解析（若 user_watchlist 仅有 name） --------------------
 def infer_market_and_format(raw_code: str) -> tuple[str, str]:
-    """
-    推断 market_type ('A','HK','US') 并格式化 code:
-    - '600519' -> ('600519','A')
-    - 'sh600519' -> ('600519','A')
-    - '0700' or '700' -> ('0700','HK') or ('700','HK') (示例)
-    - 'AAPL' -> ('AAPL','US')
-    """
+    """启发式将原始可疑代码/字符串映射为 (formatted_code, market)"""
     if not raw_code:
         return ("", "A")
     s = str(raw_code).strip()
     s_low = s.lower()
     s_clean = re.sub(r'[\s\-_\.]', '', s_low)
-
-    # sh/sz 前缀
     m = re.match(r'^(sh|sz)(0*\d+)$', s_clean)
     if m:
         return (m.group(2).lstrip("0") or m.group(2), "A")
-    # hk 前缀
     m = re.match(r'^(hk)(0*\d+)$', s_clean)
     if m:
         return (m.group(2).lstrip("0") or m.group(2), "HK")
-    # 6 位数字 -> A
     if re.fullmatch(r'\d{6}', s_clean):
         return (s_clean.lstrip("0") or s_clean, "A")
-    # 4-5 位数字 -> HK
     if re.fullmatch(r'\d{4,5}', s_clean):
         return (s_clean.lstrip("0") or s_clean, "HK")
-    # 后缀 hk
     m = re.match(r'^(\d{1,6})hk$', s_clean)
     if m:
         return (m.group(1).lstrip("0") or m.group(1), "HK")
-    # us 或 gb_ 前缀 -> US
     if s_clean.startswith("us"):
         return (s_clean[2:].upper(), "US")
     if s_clean.startswith("gb"):
         return (s_clean[2:].upper(), "US")
-    # 纯字母 -> US ticker
     if re.fullmatch(r'[a-zA-Z]{1,6}', s_clean):
         return (s_clean.upper(), "US")
-    # 字母前缀
     m = re.match(r'^([A-Za-z]+)', s_clean)
     if m:
         return (m.group(1).upper(), "US")
-    # 提取数字回退
     digits = re.sub(r'\D', '', s_clean)
     if digits:
         if len(digits) == 6:
@@ -215,54 +203,13 @@ def _extract_code_from_name(text: str) -> str | None:
         return m.group(1)
     return None
 
-def _try_stock_scanner_search(name: str) -> dict | None:
-    """
-    尝试调用 stock-scanner-mcp 的常见搜索端点以解析 name -> code。
-    若你确切知道搜索端点，请替换 endpoints 列表为实际路径以提高准确性。
-    """
-    if not name or not STOCK_SCANNER_URL:
-        return None
-    endpoints = [
-        "/search_stock", "/stock_search", "/search", "/stock_lookup",
-        "/stock_info", "/suggest", "/mcp/search", "/api/search",
-    ]
-    params_variants = [{"q": name}, {"query": name}, {"keyword": name}, {"stock_name": name}, {"name": name}]
-    headers = {"Accept": "application/json"}
-    for ep in endpoints:
-        url = f"{STOCK_SCANNER_URL.rstrip('/')}{ep}"
-        for params in params_variants:
-            try:
-                resp = requests.get(url, params=params, headers=headers, timeout=6)
-                if resp.status_code != 200:
-                    continue
-                try:
-                    j = resp.json()
-                except Exception:
-                    continue
-                candidates = []
-                if isinstance(j, list):
-                    candidates = j
-                elif isinstance(j, dict):
-                    for k in ("data", "results", "items"):
-                        if k in j and isinstance(j[k], list):
-                            candidates = j[k]
-                            break
-                    if not candidates:
-                        candidates = [j]
-                for item in candidates:
-                    if not isinstance(item, dict):
-                        continue
-                    for key in ("code", "stock_code", "symbol", "ticker", "id"):
-                        if key in item and item[key]:
-                            return item
-                    for v in item.values():
-                        if isinstance(v, str) and re.fullmatch(r'\d{4,6}', v):
-                            return item
-            except Exception:
-                continue
-    return None
-
 def resolve_code_by_name(name: str) -> tuple[str, str] | tuple[None, None]:
+    """
+    尝试将名称解析为 (code, market)：
+      1) 直接从 name 提取
+      2) 调用 DR scanner 的可能搜索 endpoint（若部署）
+      3) 启发式回退
+    """
     if not name:
         return (None, None)
     direct = _extract_code_from_name(name)
@@ -270,23 +217,47 @@ def resolve_code_by_name(name: str) -> tuple[str, str] | tuple[None, None]:
         code, market = infer_market_and_format(direct)
         if code:
             return (code, market)
-    try:
-        res = _try_stock_scanner_search(name)
-        if res:
-            for key in ("code", "stock_code", "symbol", "ticker", "id"):
-                if key in res and res[key]:
-                    c, m = infer_market_and_format(str(res[key]))
-                    if c:
-                        return (c, m)
-            for v in res.values():
-                if isinstance(v, dict):
-                    for key in ("code", "stock_code", "symbol", "ticker", "id"):
-                        if key in v and v[key]:
-                            c, m = infer_market_and_format(str(v[key]))
-                            if c:
-                                return (c, m)
-    except Exception:
-        pass
+    # 尝试调用 DR 的搜索端点 (仓库未强制规定精确名称，try common paths)
+    if DR_STOCK_SCANNER_URL:
+        search_endpoints = ["/api/search", "/api/suggest", "/api/lookup", "/api/stock_search"]
+        payloads = [{"q": name}, {"query": name}, {"keyword": name}, {"stock_name": name}]
+        for ep in search_endpoints:
+            for p in payloads:
+                try:
+                    res = _call_dr_scanner(ep, p, timeout=6)
+                    if not res:
+                        continue
+                    # parse result
+                    if isinstance(res, dict):
+                        # Try data/results array
+                        candidates = []
+                        for key in ("data", "results", "items"):
+                            if key in res and isinstance(res[key], list):
+                                candidates = res[key]
+                                break
+                        if not candidates:
+                            candidates = [res]
+                    elif isinstance(res, list):
+                        candidates = res
+                    else:
+                        candidates = []
+                    for item in candidates:
+                        if not isinstance(item, dict):
+                            continue
+                        for key in ("code", "stock_code", "symbol", "ticker", "id"):
+                            if key in item and item[key]:
+                                c, m = infer_market_and_format(str(item[key]))
+                                if c:
+                                    return (c, m)
+                        # values scanning
+                        for v in item.values():
+                            if isinstance(v, str) and re.fullmatch(r'\d{4,6}', v):
+                                c, m = infer_market_and_format(v)
+                                if c:
+                                    return (c, m)
+                except Exception:
+                    continue
+    # fallback heuristics
     fallback = _extract_code_from_name(name)
     if fallback:
         c, m = infer_market_and_format(fallback)
@@ -299,17 +270,13 @@ def resolve_code_by_name(name: str) -> tuple[str, str] | tuple[None, None]:
             return (c, m)
     return (None, None)
 
-# -------------------- Supabase 帮助函数 --------------------
+# -------------------- Supabase helpers --------------------
 def _supabase_headers():
-    return {
-        "apikey": SUPABASE_SERVICE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-        "Content-Type": "application/json"
-    }
+    return {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "Content-Type": "application/json"}
 
 def get_user_id_by_email(email: str) -> str | None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        logger.warning("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法解析 user_id。")
+        logger.warning("Supabase 未配置")
         return None
     headers = _supabase_headers()
     candidate_tables = ["users", "user_profiles", "profiles"]
@@ -331,28 +298,21 @@ def get_user_id_by_email(email: str) -> str | None:
             first = rows[0]
             uid = first.get("user_id") or first.get("id")
             if uid:
-                logger.info(f"通过表 {table} 找到 user_id={uid} for email={email}")
                 return str(uid)
             for v in first.values():
                 if v:
-                    logger.info(f"通过表 {table} 找到可能的 user_id 值={v} for email={email}")
                     return str(v)
         elif resp.status_code == 404:
-            logger.debug(f"表 {table} 不存在 (404)，跳过")
             continue
-        else:
-            logger.debug(f"查询 {table} 返回 {resp.status_code}: {resp.text}")
-    logger.warning(f"未能通过常见表解析 email={email} 对应的 user_id")
     return None
 
 def get_users_with_email_enabled(report_type: str = "morning_brief") -> list[dict]:
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        logger.error("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法查询用户列表。")
+        logger.error("Supabase 未配置")
         return []
     headers = _supabase_headers()
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/user_email_preferences"
     params = {"select": "*", "enabled": "eq.true", f"{report_type}->>enabled": "eq.true"}
-    logger.info(f"查询启用了 {report_type} 的用户...")
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
     except Exception as e:
@@ -378,18 +338,18 @@ def get_users_with_email_enabled(report_type: str = "morning_brief") -> list[dic
 
 def get_user_watchlist(user_id: str) -> list[dict]:
     """
-    从 Supabase 获取用户自选股；如果只有 name 则解析 code 与 market。
-    返回每条记录：{"name","raw_code","code","market"}
+    从 Supabase 读取 user_watchlist 表（select="*")，兼容只有 name 的情况，
+    并尝试解析 code 与 market（A/HK/US）。
+    返回每条：{"name","raw_code","code","market"}
     """
     if not user_id:
         return []
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        logger.error("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法查询自选股。")
+        logger.error("Supabase 未配置")
         return []
     headers = _supabase_headers()
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/user_watchlist"
-    params = {"select": "name,code", "user_id": f"eq.{user_id}"}
-    logger.info(f"请求 Supabase: GET {url} params={params}")
+    params = {"select": "*", "user_id": f"eq.{user_id}"}
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
     except Exception as e:
@@ -406,79 +366,112 @@ def get_user_watchlist(user_id: str) -> list[dict]:
     normalized = []
     for row in rows:
         name = row.get("name") or row.get("stock_name") or ""
-        raw_code = row.get("code") or row.get("symbol") or ""
+        raw_code = row.get("code") or row.get("symbol") or row.get("stock_code") or row.get("ticker") or row.get("id") or ""
         name = str(name).strip() if name is not None else ""
         raw_code = str(raw_code).strip() if raw_code is not None else ""
         if raw_code:
             formatted_code, market = infer_market_and_format(raw_code)
+            if not formatted_code:
+                alt_code, alt_market = resolve_code_by_name(name)
+                if alt_code:
+                    formatted_code, market = alt_code, alt_market
         else:
             formatted_code, market = resolve_code_by_name(name)
-        normalized.append({
-            "name": name or formatted_code or raw_code,
-            "raw_code": raw_code,
-            "code": formatted_code or "",
-            "market": market or "A"
-        })
-    logger.info(f"   用户 {user_id} 有 {len(normalized)} 条自选股（含格式化 code 与 market）")
+        normalized.append({"name": name or formatted_code or raw_code, "raw_code": raw_code, "code": formatted_code or "", "market": market or "A"})
     return normalized
 
-# -------------------- 使用 stock-scanner-mcp 的行情/AI 封装 --------------------
-def get_stock_quote(stock_code: str, market_type: str = "A") -> dict | None:
+# -------------------- DR scanner 基于 /api/analyze 的行情与 AI 解析封装 --------------------
+def get_ai_analysis_for_stock(stock_code: str, market_type: str = "A") -> str | None:
+    """
+    使用 DR-lin-eng/stock-scanner 的 /api/analyze（POST）获取单支股票分析（包含 AI 段落）。
+    期望返回包括 ai_analysis / price_info 等字段（根据仓库实现）。
+    """
     if not stock_code:
         return None
-    params = {"stock_code": stock_code, "market_type": market_type}
-    res = _call_stock_scanner("/stock_price", params)
+    payload = {"stock_code": stock_code}
+    # some deployments might expect market type too
+    if market_type:
+        payload["market_type"] = market_type
+    res = _call_dr_scanner("/api/analyze", payload, timeout=30)
+    if not res:
+        return None
+    # parse typical fields from repository's analyzer outputs
+    if isinstance(res, dict):
+        # try common keys
+        for key in ("ai_analysis", "ai", "analysis", "report", "result"):
+            if key in res and res[key]:
+                if isinstance(res[key], dict) and "content" in res[key]:
+                    return res[key]["content"]
+                return res[key]
+        # fallback: if report contains 'ai_analysis' inside nested 'data'
+        data = res.get("data") if isinstance(res.get("data"), dict) else None
+        if data:
+            for key in ("ai_analysis", "ai", "analysis"):
+                if key in data and data[key]:
+                    return data[key]
+        # else stringify main message
+        return json.dumps(res, ensure_ascii=False)
+    return str(res)
+
+def get_stock_quote(stock_code: str, market_type: str = "A") -> dict | None:
+    """
+    尝试通过 /api/analyze 来获取股票的 price_info（仓库将价格、指标包含在分析结果中）。
+    解析返回中常见 price_info 字段（current_price / price_info / price）
+    """
+    if not stock_code:
+        return None
+    payload = {"stock_code": stock_code}
+    if market_type:
+        payload["market_type"] = market_type
+    res = _call_dr_scanner("/api/analyze", payload, timeout=20)
     if not res:
         return None
     if isinstance(res, dict):
-        src = res["data"] if "data" in res and isinstance(res["data"], dict) else res
+        src = res.get("price_info") or res.get("data", {}).get("price_info") if isinstance(res.get("data"), dict) else None
+        if not src:
+            # try common top-level price fields
+            src = {}
+            if "current_price" in res:
+                src["price"] = res.get("current_price")
+            if "price" in res:
+                src["price"] = res.get("price")
+        # normalize
+        try:
+            price = src.get("price") or src.get("current_price") or 0
+        except Exception:
+            price = 0
         mapped = {
-            "code": src.get("code") or stock_code,
-            "name": src.get("name") or src.get("stock_name") or "",
-            "price": src.get("price") or src.get("now") or src.get("close") or 0,
-            "change": src.get("change") or src.get("chg") or src.get("percent") or 0,
-            "volume": src.get("volume") or src.get("成交量") or 0,
+            "code": stock_code,
+            "name": src.get("name") or res.get("stock_name") or "",
+            "price": price,
+            "change": src.get("price_change") or src.get("change") or res.get("change") or 0,
+            "volume": src.get("volume") or 0,
             "amount": src.get("amount") or 0,
-            "high": src.get("high") or src.get("highest") or 0,
-            "low": src.get("low") or src.get("lowest") or 0,
+            "high": src.get("high") or 0,
+            "low": src.get("low") or 0,
             "open": src.get("open") or 0,
-            "yesterday_close": src.get("pre_close") or src.get("yesterday_close") or 0,
+            "yesterday_close": src.get("yesterday_close") or src.get("pre_close") or 0,
         }
         return mapped
     return None
 
 def get_market_index() -> dict:
-    indices_codes = {"sh": ("000001", "A"), "sz": ("399001", "A"), "cyb": ("399006", "A")}
+    """基于 get_stock_quote 调用获取主要指数（上证/深证/创业板）"""
+    indices = {"sh": ("000001", "A"), "sz": ("399001", "A"), "cyb": ("399006", "A")}
     out = {}
-    for k, (code, mt) in indices_codes.items():
+    for k, (code, mt) in indices.items():
+        # try variants
         candidates = [code, f"sh{code}", f"sz{code}"]
-        quote = None
+        q = None
         for c in candidates:
             q = get_stock_quote(c, mt)
             if q:
-                quote = q
                 break
-        if quote:
-            out[k] = {"name": quote.get("name") or k, "code": code, "price": quote.get("price"), "change": quote.get("change")}
+        if q:
+            out[k] = {"name": q.get("name") or k, "code": code, "price": q.get("price"), "change": q.get("change")}
     return out
 
-def get_ai_analysis_for_stock(stock_code: str, market_type: str = "A") -> str | None:
-    if not stock_code:
-        return None
-    params = {"stock_code": stock_code, "market_type": market_type}
-    res = _call_stock_scanner("/stock_ai_analysis", params, timeout=40)
-    if not res:
-        return None
-    if isinstance(res, dict):
-        for key in ("ai_analysis", "ai", "content", "html", "data", "result"):
-            if key in res and res[key]:
-                if isinstance(res[key], dict) and "content" in res[key]:
-                    return res[key]["content"]
-                return res[key]
-        return str(res)
-    return str(res)
-
-# -------------------- AI 内容生成（优先 stock-scanner-mcp，再 zhipuai 回退） --------------------
+# -------------------- 组合生成 AI 报告段落 --------------------
 def generate_ai_content_for_watchlist(watchlist: list) -> str:
     parts = []
     for s in (watchlist or [])[:8]:
@@ -492,41 +485,28 @@ def generate_ai_content_for_watchlist(watchlist: list) -> str:
         if ai_text:
             parts.append(f"<h3>{name} ({code} - {market})</h3><div>{ai_text}</div>")
         else:
-            prompt = f"请对股票 {name} ({code}, 市场 {market}) 做简短分析，包含趋势与操作建议（中文，约100字）。"
-            z = _call_zhipu(prompt)
+            prompt = f"请给出对股票 {name} ({code}) 的简短分析（中文，约100字）。"
+            z = call_zhipu(prompt)
             if z:
-                parts.append(f"<h3>{name} ({code} - {market})</h3><div>{z}</div>")
+                parts.append(f"<h3>{name} ({code})</h3><div>{z}</div>")
             else:
-                parts.append(f"<p><strong>{name} ({code})</strong>：无法获取 AI 分析，使用回退简述。</p>")
-    if not parts:
-        return "<p>暂无可用自选股分析。</p>"
-    return "\n".join(parts)
+                parts.append(f"<p><strong>{name} ({code})</strong>：无法获取 AI 分析。</p>")
+    return "\n".join(parts) if parts else "<p>暂无可用自选股分析。</p>"
 
-# -------------------- 报告生成 --------------------
+# -------------------- 报告生成函数 --------------------
 def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
-    logger.info(f"为用户 {str(user_id)[:12]}... 生成早市简报")
     try:
         indices = get_market_index()
         stock_context = generate_ai_content_for_watchlist(watchlist)
-        header = "<p>以下内容来自 stock-scanner-mcp 的 AI 分析模块（按自选股汇总）。</p>"
         indices_html = ""
         if indices:
-            indices_html += "<ul>"
-            for k, idx in indices.items():
-                try:
-                    change = float(idx.get("change") or 0)
-                except Exception:
-                    change = 0
-                indices_html += f"<li>{idx.get('name')}: {idx.get('price')} ({('+' if change>0 else '')}{change})</li>"
-            indices_html += "</ul>"
+            indices_html = "<ul>" + "".join([f"<li>{idx['name']}: {idx['price']} ({idx['change']})</li>" for idx in indices.values()]) + "</ul>"
         content = f"""
-        <h2>早市快讯</h2>
-        {header}
-        <h3>市场要点</h3>
-        {indices_html}
-        <h3>自选股深度分析</h3>
-        {stock_context}
-        <p>提示：以上 AI 分析来自 stock-scanner-mcp 的 /stock_ai_analysis 接口，可能包含模型输出的建议，仅供参考。</p>
+            <h2>早市简报</h2>
+            <h3>市场要点</h3>
+            {indices_html}
+            <h3>自选股深度分析</h3>
+            {stock_context}
         """
         return content
     except Exception as e:
@@ -534,112 +514,61 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
         return generate_default_morning_brief(watchlist)
 
 def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
-    logger.info(f"为用户 {str(user_id)[:12]}... 生成中市回顾")
     try:
         indices = get_market_index()
         stock_quotes = []
-        for stock in watchlist[:10]:
-            code = stock.get("code") or ""
-            market = stock.get("market", "A") or "A"
+        for s in watchlist[:10]:
+            code = s.get("code") or s.get("raw_code") or ""
+            market = s.get("market", "A") or "A"
             if not code:
                 continue
             q = get_stock_quote(code, market)
             if q:
                 stock_quotes.append(q)
-        market_context = "<ul>"
-        for key, idx in indices.items():
-            try:
-                change = float(idx.get("change") or 0)
-            except Exception:
-                change = 0
-            market_context += f"<li>{idx.get('name')}: {idx.get('price')} ({('+' if change>0 else '')}{change}%)</li>"
-        market_context += "</ul>"
-        stocks_context = "<ul>"
-        for q in stock_quotes:
-            try:
-                change = float(q.get("change") or 0)
-            except Exception:
-                change = 0
-            stocks_context += f"<li>{q.get('name')} ({q.get('code')}): {q.get('price')} ({('+' if change>0 else '')}{change}%)</li>"
-        stocks_context += "</ul>"
+        market_html = "<ul>" + "".join([f"<li>{v['name']}: {v['price']} ({v['change']})</li>" for v in indices.values()]) + "</ul>" if indices else ""
+        stocks_html = "<ul>" + "".join([f"<li>{q['name']} ({q['code']}): {q['price']} ({q['change']})</li>" for q in stock_quotes]) + "</ul>"
         ai_block = generate_ai_content_for_watchlist(watchlist[:5])
-        content = f"""
-        <h2>中市回顾</h2>
-        <h3>上午市场表现</h3>
-        {market_context}
-        <h3>自选股表现</h3>
-        {stocks_context}
-        <h3>AI 简短点评（自选股）</h3>
-        {ai_block}
-        """
-        return content
+        return f"<h2>中市回顾</h2><h3>上午市场表现</h3>{market_html}<h3>自选股</h3>{stocks_html}<h3>AI点评</h3>{ai_block}"
     except Exception as e:
         logger.error(f"生成中市回顾失败: {e}")
         return generate_default_midday_review(watchlist)
 
 def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
-    logger.info(f"为用户 {str(user_id)[:12]}... 生成尾市总结")
     try:
         indices = get_market_index()
         stock_quotes = []
-        for stock in watchlist[:20]:
-            code = stock.get("code") or ""
-            market = stock.get("market", "A") or "A"
+        for s in watchlist[:20]:
+            code = s.get("code") or s.get("raw_code") or ""
+            market = s.get("market", "A") or "A"
             if not code:
                 continue
             q = get_stock_quote(code, market)
             if q:
                 stock_quotes.append(q)
-        market_context = "<ul>"
-        for key, idx in indices.items():
-            try:
-                change = float(idx.get("change") or 0)
-            except Exception:
-                change = 0
-            market_context += f"<li>{idx.get('name')}: {idx.get('price')} ({('+' if change>0 else '')}{change}%)</li>"
-        market_context += "</ul>"
         sorted_by_change = sorted(stock_quotes, key=lambda x: float(x.get("change") or 0), reverse=True)
-        top_gainers = sorted_by_change[:3]
-        top_losers = sorted_by_change[-3:]
-        gain_html = "<ul>"
-        for q in top_gainers:
-            gain_html += f"<li>{q.get('name')} ({q.get('code')}): {q.get('price')} ({q.get('change')}%)</li>"
-        gain_html += "</ul>"
-        lose_html = "<ul>"
-        for q in top_losers:
-            lose_html += f"<li>{q.get('name')} ({q.get('code')}): {q.get('price')} ({q.get('change')}%)</li>"
-        lose_html += "</ul>"
+        gain_html = "<ul>" + "".join([f"<li>{q['name']} ({q['code']}): {q['price']} ({q['change']})</li>" for q in sorted_by_change[:3]]) + "</ul>"
+        lose_html = "<ul>" + "".join([f"<li>{q['name']} ({q['code']}): {q['price']} ({q['change']})</li>" for q in sorted_by_change[-3:]]) + "</ul>"
         ai_block = generate_ai_content_for_watchlist(watchlist[:5])
-        content = f"""
-        <h2>尾市总结</h2>
-        <h3>今日收盘要点</h3>
-        {market_context}
-        <h3>涨幅榜（自选股）</h3>
-        {gain_html}
-        <h3>跌幅榜（自选股）</h3>
-        {lose_html}
-        <h3>AI 深度点评（自选股）</h3>
-        {ai_block}
-        """
-        return content
+        market_html = "<ul>" + "".join([f"<li>{v['name']}: {v['price']} ({v['change']})</li>" for v in indices.values()]) + "</ul>" if indices else ""
+        return f"<h2>尾市总结</h2><h3>收盘要点</h3>{market_html}<h3>涨幅榜</h3>{gain_html}<h3>跌幅榜</h3>{lose_html}<h3>AI点评</h3>{ai_block}"
     except Exception as e:
         logger.error(f"生成尾市总结失败: {e}")
         return generate_default_eod_summary(watchlist)
 
-# -------------------- 默认回退内容 --------------------
+# -------------------- 默认回退 --------------------
 def generate_default_morning_brief(watchlist: list) -> str:
-    stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
-    return f"""<h2>📅 早市简报</h2><p>当前 AI/行情服务不可用，采用默认回退。</p><p>您的自选股：{stock_list}</p>"""
+    stock_list = ", ".join([s.get("name", "") for s in (watchlist or [])[:5]]) or "暂无自选股"
+    return f"<h2>早市简报（回退）</h2><p>您的自选股：{stock_list}</p>"
 
 def generate_default_midday_review(watchlist: list) -> str:
-    stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
-    return f"""<h2>☀️ 中市回顾</h2><p>当前 AI/行情服务不可用，采用默认回退。</p><p>您的自选股：{stock_list}</p>"""
+    stock_list = ", ".join([s.get("name", "") for s in (watchlist or [])[:5]]) or "暂无自选股"
+    return f"<h2>中市回顾（回退）</h2><p>您的自选股：{stock_list}</p>"
 
 def generate_default_eod_summary(watchlist: list) -> str:
-    stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
-    return f"""<h2>🌙 尾市总结</h2><p>当前 AI/行情服务不可用，采用默认回退。</p><p>您的自选股：{stock_list}</p>"""
+    stock_list = ", ".join([s.get("name", "") for s in (watchlist or [])[:5]]) or "暂无自选股"
+    return f"<h2>尾市总结（回退）</h2><p>您的自选股：{stock_list}</p>"
 
-# -------------------- 邮件创建与发送 --------------------
+# -------------------- 邮件发送 --------------------
 def create_simple_html(title: str, content: str) -> str:
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>{title}</title></head>
     <body style="margin:0;padding:0;font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;">
@@ -656,7 +585,6 @@ def create_simple_html(title: str, content: str) -> str:
 
 def send_email(to_email: str, subject: str, html_content: str) -> bool:
     try:
-        logger.info(f"准备发送邮件到: {to_email} 主题: {subject}")
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = formataddr((FROM_NAME, FROM_EMAIL))
@@ -665,79 +593,62 @@ def send_email(to_email: str, subject: str, html_content: str) -> bool:
         msg.attach(html_part)
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.starttls()
-            logger.info("SMTP TLS 已启用")
             server.login(SMTP_USER, RESEND_API_KEY)
-            logger.info("SMTP 登录成功")
             server.send_message(msg)
-            logger.info(f"邮件发送成功到 {to_email}")
-            return True
-    except smtplib.SMTPAuthenticationError as e:
-        logger.error(f"SMTP 认证失败: {e}")
-        return False
-    except smtplib.SMTPException as e:
-        logger.error(f"SMTP 错误: {e}")
-        return False
+        logger.info(f"邮件发送成功到 {to_email}")
+        return True
     except Exception as e:
-        logger.error(f"发送邮件时出错: {e}")
+        logger.error(f"发送邮件失败: {e}")
         return False
 
-# -------------------- 主调度 --------------------
+# -------------------- 主发送流程 --------------------
 def send_report(report_type: str):
-    logger.info("=" * 60)
-    report_names = {"morning_brief": "早市简报", "midday_review": "中市回顾", "eod_summary": "尾市总结"}
-    title_prefixes = {"morning_brief": "📅 早市简报", "midday_review": "☀️ 中市回顾", "eod_summary": "🌙 尾市总结"}
-    logger.info(f"开始执行：{report_names.get(report_type, report_type)}")
+    logger.info(f"开始发送报告: {report_type}")
     users = get_users_with_email_enabled(report_type)
     if not users:
-        logger.warning("没有启用的用户，任务结束")
+        logger.warning("没有启用的用户")
         return
-    logger.info(f"找到 {len(users)} 个启用的用户")
-    success_count = 0
-    failed_count = 0
-    title_prefix = title_prefixes.get(report_type, "📊 股市报告")
+    success = 0
+    failed = 0
     for user in users:
         email = user.get("email") or user.get("contact") or ""
-        user_id = user.get("resolved_user_id", "")
-        logger.info(f"处理用户: email={email}, user_id={user_id}")
+        uid = user.get("resolved_user_id", "")
         if not email:
-            logger.warning("用户没有设置邮箱，跳过")
-            failed_count += 1
+            failed += 1
             continue
-        watchlist = get_user_watchlist(user_id)
-        logger.info(f"找到 {len(watchlist)} 只自选股")
+        watchlist = get_user_watchlist(uid)
         if report_type == "morning_brief":
-            content = generate_morning_brief_ai(user_id, watchlist)
+            content = generate_morning_brief_ai(uid, watchlist)
+            title_prefix = "📅 早市简报"
         elif report_type == "midday_review":
-            content = generate_midday_review_ai(user_id, watchlist)
+            content = generate_midday_review_ai(uid, watchlist)
+            title_prefix = "☀️ 中市回顾"
         elif report_type == "eod_summary":
-            content = generate_eod_summary_ai(user_id, watchlist)
+            content = generate_eod_summary_ai(uid, watchlist)
+            title_prefix = "🌙 尾市总结"
         else:
-            logger.error(f"未知报告类型: {report_type}")
-            failed_count += 1
+            logger.error("未知报告类型")
+            failed += 1
             continue
         html = create_simple_html(title_prefix, content)
-        today = datetime.now().strftime("%Y年%m月%d日 %A")
-        subject = f"{title_prefix} - {today}"
+        subject = f"{title_prefix} - {datetime.now().strftime('%Y年%m月%d日 %A')}"
         if send_email(email, subject, html):
-            success_count += 1
+            success += 1
         else:
-            failed_count += 1
-    logger.info("=" * 60)
-    logger.info(f"任务完成: 成功 {success_count}, 失败 {failed_count}")
-    logger.info("=" * 60)
+            failed += 1
+    logger.info(f"完成: 成功 {success}, 失败 {failed}")
 
-# -------------------- CLI --------------------
+# -------------------- CLI 入口 --------------------
 def main():
     if len(sys.argv) < 2:
         print("用法: python email_system.py <report_type>")
-        print("  report_type: morning_brief | midday_review | eod_summary")
-        print("示例: STOCK_SCANNER_URL=http://localhost:8000 python email_system.py morning_brief")
+        print("report_type: morning_brief | midday_review | eod_summary")
+        print("示例: DR_STOCK_SCANNER_URL=http://localhost:8443 python email_system.py morning_brief")
         sys.exit(1)
     report_type = sys.argv[1].lower()
-    valid_types = ["morning_brief", "midday_review", "eod_summary"]
-    if report_type not in valid_types:
-        logger.error(f"无效的报告类型: {report_type}")
-        logger.error(f"有效类型: {', '.join(valid_types)}")
+    valid = ["morning_brief", "midday_review", "eod_summary"]
+    if report_type not in valid:
+        logger.error("无效报告类型")
         sys.exit(1)
     send_report(report_type)
 
