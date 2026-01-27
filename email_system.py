@@ -1,27 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AI-driven email report system (full replacement)
-
-Features / improvements:
-- Read sensitive keys from environment variables (recommended) with optional fallbacks.
-- Supabase access: fetch enabled users from user_email_preferences, resolve user_id by email,
-  then fetch user's watchlist from user_watchlist (name column).
-- Lazy imports for akshare and zhipuai with single-time warnings and graceful degradation.
-- akshare compatibility layer with candidate function names and retry/backoff for transient network errors.
-- zhipuai compatibility layer tolerant to different SDK return shapes.
-- Robust logging and non-fatal failures: system will continue sending emails even if AI or market data is unavailable.
-- Keep API for calling: `python email_system.py <report_type>` where report_type in
-  ['morning_brief', 'midday_review', 'eod_summary'].
-
-IMPORTANT:
-- Store sensitive values (SUPABASE_SERVICE_KEY, RESEND_API_KEY, ZHIPUAI_API_KEY, etc.)
-  in environment variables or GitHub Secrets and do NOT hardcode them in source.
+AI驱动邮件发送系统 - 完整版本（所有配置与密钥已硬编码到顶部）
+注意：你要求将所有 URL 和 API keys 直接写入代码。这样做有泄露风险（请确保仓库为私有并谨慎管理）。
 """
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 import smtplib
@@ -34,43 +19,42 @@ from email.utils import formataddr
 from http.client import RemoteDisconnected
 from requests.exceptions import ConnectionError as RequestsConnectionError
 
-# -------------------- Configuration / Secrets --------------------
-# Prefer environment variables. If you must use hardcoded values for local testing,
-# set them here (NOT recommended for production).
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")            # Resend SMTP/API key
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.resend.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "resend")
-FROM_NAME = os.getenv("FROM_NAME", "Portfolio Guardian")
-FROM_EMAIL = os.getenv("FROM_EMAIL", "noreply@example.com")
+# -------------------- 全部硬编码配置（按你的要求） --------------------
+# Resend (SMTP)
+RESEND_API_KEY = "re_Nm5shWrw_4Xp8c94P9VFQ12SC7BxEuuv7"
+SMTP_HOST = "smtp.resend.com"
+SMTP_PORT = 587
+SMTP_USER = "resend"
+FROM_NAME = "Portfolio Guardian"
+FROM_EMAIL = "noreply@chenzhaoqi.asia"
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")               # e.g. https://<project-ref>.supabase.co
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+# Supabase (数据库)
+SUPABASE_URL = "https://ayjxvejaztusajdntbkh.supabase.co"
+SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImF5anh2ZWphenR1c2FqZG50YmtoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2ODQ0ODAxMSwiZXhwIjoyMDg0MDI0MDExfQ.2Ebe2Ft1gPEfyem0Qie9fGaQ8P3uhJvydGBFyCkvIgE"
 
-ZHIPUAI_API_KEY = os.getenv("ZHIPUAI_API_KEY", "")
+# 智谱AI (AI 内容生成)
+ZHIPUAI_API_KEY = "21f9ca7cfa0d44f4afeed5ed9d083b23.4zxzk7cZBhr0wnz7"
 
-# -------------------- Logging --------------------
+# -------------------- 日志配置 --------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- Lazy import state --------------------
-_AKSHARE = None        # None = unknown, False = missing, module = imported
-_ZHIPUAI_CLS = None    # None = unknown, False = missing, class = ZhipuAI
+# -------------------- 惰性导入状态 --------------------
+_AKSHARE = None        # None = 未知, False = 缺失, module = 已导入
+_ZHIPUAI_CLS = None    # None = 未知, False = 缺失, class = ZhipuAI
 _logged_missing = set()
 
-
-# -------------------- Lazy import helpers --------------------
+# -------------------- 惰性导入帮助函数 --------------------
 def _import_akshare():
-    """Lazily import akshare. Return module or None if not available."""
     global _AKSHARE, _logged_missing
     if _AKSHARE is None:
         try:
             import akshare as ak
             _AKSHARE = ak
-            logger.info("akshare imported")
+            logger.info("akshare 已导入")
         except ImportError:
             _AKSHARE = False
             if "akshare" not in _logged_missing:
@@ -81,15 +65,13 @@ def _import_akshare():
             logger.warning(f"导入 akshare 时出错（已降级）：{e}")
     return _AKSHARE if _AKSHARE else None
 
-
 def _import_zhipuai_class():
-    """Lazily import ZhipuAI class from zhipuai SDK. Return class or None if unavailable."""
     global _ZHIPUAI_CLS, _logged_missing
     if _ZHIPUAI_CLS is None:
         try:
             from zhipuai import ZhipuAI  # type: ignore
             _ZHIPUAI_CLS = ZhipuAI
-            logger.info("zhipuai SDK imported")
+            logger.info("zhipuai SDK 已导入")
         except ImportError:
             _ZHIPUAI_CLS = False
             if "zhipuai" not in _logged_missing:
@@ -100,10 +82,9 @@ def _import_zhipuai_class():
             logger.warning(f"导入 zhipuai 时出错（已降级）：{e}")
     return _ZHIPUAI_CLS if _ZHIPUAI_CLS else None
 
-
-# -------------------- zhipuai wrapper --------------------
+# -------------------- zhipuai 封装 --------------------
 def get_zhipu_client():
-    """Return a zhipuai client instance or None if unavailable."""
+    """返回 zhipuai 客户端实例，若不可用返回 None"""
     if not ZHIPUAI_API_KEY:
         logger.warning("未设置 ZHIPUAI_API_KEY；AI 内容生成将被禁用。")
         return None
@@ -118,19 +99,14 @@ def get_zhipu_client():
         logger.error(f"初始化智谱AI客户端失败: {e}")
         return None
 
-
 def generate_ai_content(prompt: str) -> str | None:
-    """
-    Generate content using zhipuai. Return string or None on failure (caller should fallback).
-    This function is tolerant to different SDK response shapes.
-    """
+    """使用智谱AI生成内容，失败返回 None 以触发默认回退"""
     try:
         client = get_zhipu_client()
         if not client:
             return None
 
         logger.info("正在调用智谱AI生成内容...")
-        # Many versions provide client.chat.completions.create; some return dicts.
         try:
             response = client.chat.completions.create(
                 model="glm-4-flash",
@@ -139,18 +115,14 @@ def generate_ai_content(prompt: str) -> str | None:
                 max_tokens=2000
             )
         except Exception as e:
-            # Some SDKs might expose different methods; try a fallback call if available
             try:
-                # e.g. client.create in some custom wrappers
                 response = client.create(prompt=prompt)
             except Exception:
                 raise e
 
-        # Parse response robustly
         content = None
         try:
             if hasattr(response, "choices"):
-                # Typical object-based SDK
                 content = getattr(response.choices[0].message, "content", None) \
                           or getattr(response.choices[0], "text", None)
             elif isinstance(response, dict):
@@ -159,7 +131,6 @@ def generate_ai_content(prompt: str) -> str | None:
                     first = choices[0]
                     content = (first.get("message") or {}).get("content") or first.get("text") or None
             else:
-                # Last resort: try to stringize
                 content = str(response)
         except Exception:
             content = None
@@ -175,8 +146,7 @@ def generate_ai_content(prompt: str) -> str | None:
         logger.error(f"AI 生成内容失败: {e}")
         return None
 
-
-# -------------------- Supabase helpers --------------------
+# -------------------- Supabase 帮助函数 --------------------
 def _supabase_headers():
     return {
         "apikey": SUPABASE_SERVICE_KEY,
@@ -184,12 +154,8 @@ def _supabase_headers():
         "Content-Type": "application/json"
     }
 
-
 def get_user_id_by_email(email: str) -> str | None:
-    """
-    Resolve a user_id by email. Tries common user tables: users, user_profiles, profiles.
-    Returns the first found id (string) or None.
-    """
+    """通过常见用户表解析 email 对应的 user_id"""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.warning("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法解析 user_id。")
         return None
@@ -213,12 +179,10 @@ def get_user_id_by_email(email: str) -> str | None:
             if not rows:
                 continue
             first = rows[0]
-            # Try common id fields
             uid = first.get("user_id") or first.get("id")
             if uid:
                 logger.info(f"通过表 {table} 找到 user_id={uid} for email={email}")
                 return str(uid)
-            # fallback: first non-empty value
             for v in first.values():
                 if v:
                     logger.info(f"通过表 {table} 找到可能的 user_id 值={v} for email={email}")
@@ -231,19 +195,14 @@ def get_user_id_by_email(email: str) -> str | None:
     logger.warning(f"未能通过常见表解析 email={email} 对应的 user_id")
     return None
 
-
 def get_users_with_email_enabled(report_type: str = "morning_brief") -> list[dict]:
-    """
-    Query user_email_preferences for users who enabled `report_type`.
-    Adds a 'resolved_user_id' key to each record (empty string if unresolved).
-    """
+    """查询 user_email_preferences 并解析 resolved_user_id"""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
         logger.error("SUPABASE_URL 或 SUPABASE_SERVICE_KEY 未设置；无法查询用户列表。")
         return []
 
     headers = _supabase_headers()
     url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/user_email_preferences"
-    # If your table stores each report preference in a JSONB column, the JSON path filter is used.
     params = {
         "select": "*",
         "enabled": "eq.true",
@@ -280,12 +239,8 @@ def get_users_with_email_enabled(report_type: str = "morning_brief") -> list[dic
         enhanced.append(rec)
     return enhanced
 
-
 def get_user_watchlist(user_id: str) -> list[dict]:
-    """
-    Fetch user's watchlist from user_watchlist table.
-    Only select the 'name' column (as requested). Return list of dicts with keys 'name' and 'code' (code empty).
-    """
+    """按 user_id 从 user_watchlist 表查询 name，并标准化为 {'name','code'}（code 为空）"""
     if not user_id:
         return []
 
@@ -314,22 +269,16 @@ def get_user_watchlist(user_id: str) -> list[dict]:
         logger.error(f"解析自选股响应失败: {e}")
         return []
 
-    normalized: list[dict] = []
+    normalized = []
     for row in rows:
         name = row.get("name") or row.get("stock_name") or ""
         name = str(name).strip() if name is not None else ""
-        # Database currently has no code column; keep code empty to avoid previous 42703 error.
         normalized.append({"name": name, "code": ""})
     logger.info(f"   用户 {user_id} 有 {len(normalized)} 只自选股（仅 name 字段）")
     return normalized
 
-
-# -------------------- akshare compatibility + retry layer --------------------
+# -------------------- akshare 兼容 + 重试层 --------------------
 def _ak_call_with_fallback(ak_module, candidate_names, *args, retries=3, backoff=1, **kwargs):
-    """
-    Try function names in candidate_names on ak_module with transient retry/backoff.
-    Return the first successful result or None.
-    """
     if not ak_module:
         return None
 
@@ -351,9 +300,7 @@ def _ak_call_with_fallback(ak_module, candidate_names, *args, retries=3, backoff
                 break
     return None
 
-
 def get_stock_news(stock_codes: list, days: int = 1) -> list[dict]:
-    """Get news for given stock codes using akshare. Returns [] if unavailable."""
     ak = _import_akshare()
     if not ak:
         return []
@@ -377,9 +324,7 @@ def get_stock_news(stock_codes: list, days: int = 1) -> list[dict]:
             continue
     return all_news[:30]
 
-
 def get_market_news_summary() -> list[dict]:
-    """Get market news summary using akshare. Return [] if unavailable."""
     ak = _import_akshare()
     if not ak:
         return []
@@ -399,9 +344,7 @@ def get_market_news_summary() -> list[dict]:
         logger.warning(f"获取市场新闻失败: {e}")
         return []
 
-
 def get_stock_quote(stock_code: str) -> dict | None:
-    """Get a single stock quote. Return None if not available."""
     ak = _import_akshare()
     if not ak:
         return None
@@ -438,9 +381,7 @@ def get_stock_quote(stock_code: str) -> dict | None:
         return None
     return None
 
-
 def get_market_index() -> dict:
-    """Return dict of indices (sh, sz, cyb). Empty dict on failure."""
     ak = _import_akshare()
     if not ak:
         return {}
@@ -473,8 +414,7 @@ def get_market_index() -> dict:
         logger.warning(f"获取指数行情失败: {e}")
         return {}
 
-
-# -------------------- AI content generation for each report --------------------
+# -------------------- AI 内容生成（按报告类型） --------------------
 def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
     logger.info(f"为用户 {str(user_id)[:12]}... 生成早市简报")
     try:
@@ -489,7 +429,7 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
             for n in market_news[:10]:
                 news_context += f"- {n['title']}\n"
         if stock_news:
-            news_context += "\n���自选股相关新闻】\n"
+            news_context += "\n【自选股相关新闻】\n"
             for n in stock_news[:10]:
                 news_context += f"- [{n['stock']}] {n['title']}\n"
 
@@ -516,7 +456,6 @@ def generate_morning_brief_ai(user_id: str, watchlist: list) -> str:
     except Exception as e:
         logger.error(f"生成早市简报失败: {e}")
         return generate_default_morning_brief(watchlist)
-
 
 def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
     logger.info(f"为用户 {str(user_id)[:12]}... 生成中市回顾")
@@ -563,7 +502,6 @@ def generate_midday_review_ai(user_id: str, watchlist: list) -> str:
     except Exception as e:
         logger.error(f"生成中市回顾失败: {e}")
         return generate_default_midday_review(watchlist)
-
 
 def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
     logger.info(f"为用户 {str(user_id)[:12]}... 生成尾市总结")
@@ -614,8 +552,7 @@ def generate_eod_summary_ai(user_id: str, watchlist: list) -> str:
         logger.error(f"生成尾市总结失败: {e}")
         return generate_default_eod_summary(watchlist)
 
-
-# -------------------- Default fallback content --------------------
+# -------------------- 默认回退内容 --------------------
 def generate_default_morning_brief(watchlist: list) -> str:
     stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
     return f"""
@@ -624,7 +561,6 @@ def generate_default_morning_brief(watchlist: list) -> str:
     <p>您的自选股：{stock_list}</p>
     <p>提示：请关注今日开盘及自选股表现。</p>
     """
-
 
 def generate_default_midday_review(watchlist: list) -> str:
     stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
@@ -635,7 +571,6 @@ def generate_default_midday_review(watchlist: list) -> str:
     <p>提示：请关注午后走势。</p>
     """
 
-
 def generate_default_eod_summary(watchlist: list) -> str:
     stock_list = ", ".join([f"{s.get('name','')}" for s in watchlist[:5]]) or "暂无自选股"
     return f"""
@@ -645,8 +580,7 @@ def generate_default_eod_summary(watchlist: list) -> str:
     <p>提示：请查看自选股今日表现并做好盘后总结。</p>
     """
 
-
-# -------------------- Email creation & sending --------------------
+# -------------------- 邮件创建与发送（使用 SMTP） --------------------
 def create_simple_html(title: str, content: str) -> str:
     return f"""<!DOCTYPE html>
 <html>
@@ -664,9 +598,8 @@ def create_simple_html(title: str, content: str) -> str:
 </body>
 </html>"""
 
-
 def send_email(to_email: str, subject: str, html_content: str) -> bool:
-    """Send email via SMTP (Resend). Return True on success."""
+    """通过 SMTP 发送邮件（使用硬编码的 RESEND_API_KEY 作为密码）"""
     try:
         logger.info(f"准备发送邮件到: {to_email}")
         logger.info(f"   主题: {subject}")
@@ -698,8 +631,7 @@ def send_email(to_email: str, subject: str, html_content: str) -> bool:
         logger.error(f"发送邮件时出错: {e}")
         return False
 
-
-# -------------------- Main orchestration --------------------
+# -------------------- 主调度与报告发送 --------------------
 def send_report(report_type: str):
     logger.info("=" * 60)
     report_names = {"morning_brief": "早市简报", "midday_review": "中市回顾", "eod_summary": "尾市总结"}
@@ -742,7 +674,7 @@ def send_report(report_type: str):
         elif report_type == "eod_summary":
             content = generate_eod_summary_ai(user_id, watchlist)
         else:
-            logger.error(f"未知的报���类型: {report_type}")
+            logger.error(f"未知的报告类型: {report_type}")
             failed_count += 1
             continue
 
@@ -756,15 +688,14 @@ def send_report(report_type: str):
             failed_count += 1
 
     logger.info("\n" + "=" * 60)
-    logger.info(f"任��完成: 成功 {success_count}, 失败 {failed_count}")
+    logger.info(f"任务完成: 成功 {success_count}, 失败 {failed_count}")
     logger.info("=" * 60)
-
 
 def main():
     if len(sys.argv) < 2:
         print("用法: python email_system.py <report_type>")
         print("")
-        print("报告类型:")
+        print("报告���型:")
         print("  morning_brief  - 早市简报 (08:30)")
         print("  midday_review  - 中市回顾 (12:00)")
         print("  eod_summary    - 尾市总结 (16:30)")
@@ -774,7 +705,7 @@ def main():
         print("  python email_system.py midday_review")
         print("  python email_system.py eod_summary")
         print("")
-        print("请使用环境变量配置敏感密钥（推荐）：SUPABASE_SERVICE_KEY, SUPABASE_URL, RESEND_API_KEY, ZHIPUAI_API_KEY")
+        print("所有配置与密钥已硬编码到文件顶部（请确保私有管理）。")
         sys.exit(1)
 
     report_type = sys.argv[1].lower()
@@ -785,7 +716,6 @@ def main():
         sys.exit(1)
 
     send_report(report_type)
-
 
 if __name__ == "__main__":
     main()
