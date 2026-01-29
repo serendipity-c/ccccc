@@ -26,6 +26,7 @@ import logging
 import threading
 import smtplib
 import requests
+import requirements
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from datetime import datetime
 from email.mime.text import MIMEText
