@@ -1,21 +1,21 @@
-# 每日定时在 Asia/Shanghai (UTC+8) 的 08:00, 12:00, 16:30 运行 email_system.py
-# 说明：
-# - 该 workflow 设计为在你的 self-hosted runner（在本地注册的 runner）上运行，
-#   以便能访问本地运行的 DR-lin-eng/stock-scanner 服务与本地资源。
-# - 请在你的 self-hosted runner 注册时使用 label（例如 "local-runner"），
-#   然后把 runs-on 设置为 [self-hosted, linux, local-runner]。
-# - 在仓库 Secrets 配置下列敏感项并映射到 runner 的环境（推荐）：
-#     SUPABASE_SERVICE_KEY, RESEND_API_KEY, SMTP_HOST, SMTP_PORT, SMTP_USER, FROM_EMAIL, FROM_NAME
-# - workflow_dispatch 提供手动触发与 report_type 覆盖，用于测试。
+# GitHub-hosted runner workflow
+# - Runs on ubuntu-latest (GitHub-hosted)
+# - Schedule (Asia/Shanghai): 08:00, 12:00, 16:30
+#   cron expressed in UTC:
+#     08:00 CST -> 00:00 UTC  => '0 0 * * *'
+#     12:00 CST -> 04:00 UTC  => '0 4 * * *'
+#     16:30 CST -> 08:30 UTC  => '30 8 * * *'
+# - Requires DR_STOCK_SCANNER_URL to be a publicly reachable URL (or tunnel URL)
+# - Expects email_system.py at repo root (script reads env vars for secrets)
 on:
   schedule:
-    - cron: '0 0 * * *'    # 08:00 Asia/Shanghai -> 00:00 UTC
-    - cron: '0 4 * * *'    # 12:00 Asia/Shanghai -> 04:00 UTC
-    - cron: '30 8 * * *'   # 16:30 Asia/Shanghai -> 08:30 UTC
+    - cron: '0 0 * * *'    # 08:00 Asia/Shanghai
+    - cron: '0 4 * * *'    # 12:00 Asia/Shanghai
+    - cron: '30 8 * * *'   # 16:30 Asia/Shanghai
   workflow_dispatch:
     inputs:
       report_type:
-        description: '可选：覆盖报告类型 (morning_brief | midday_review | eod_summary)'
+        description: 'Optional. Override scheduled report type: morning_brief | midday_review | eod_summary'
         required: false
         default: ''
         type: choice
@@ -23,19 +23,23 @@ on:
           - morning_brief
           - midday_review
           - eod_summary
+      dr_stock_scanner_url:
+        description: 'Optional. Override DR_STOCK_SCANNER_URL for this run (e.g. https://abc.ngrok.io)'
+        required: false
+        default: ''
 
-name: Send Stock Reports (self-hosted)
+name: Send Stock Reports (hosted runner)
 
 permissions:
   contents: read
 
 jobs:
   send_reports:
-    # 请确保你的 self-hosted runner 已注册并带有 local-runner 标签
-    runs-on: [self-hosted, linux, local-runner]
-
-    # 将敏感配置通过 secrets 注入到 job 环境中（建议在仓库 Secrets 中配置）
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
+      # Provide secrets in repository Settings -> Secrets and variables -> Actions
+      DR_STOCK_SCANNER_URL: ${{ secrets.DR_STOCK_SCANNER_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
       SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -43,12 +47,8 @@ jobs:
       SMTP_USER: ${{ secrets.SMTP_USER }}
       FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
       FROM_NAME: ${{ secrets.FROM_NAME }}
-      # 如果你希望脚本在 runner 上启动 Flask 并监听 localhost:5000，默认无需额外 URL
-      DR_FLASK_HOST: "0.0.0.0"
-      DR_FLASK_PORT: "5000"
-
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -59,27 +59,39 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f "requirements.txt" ]; then
+          if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
             pip install requests python-dotenv
           fi
 
-      - name: Run email_system.py (decide report type by Asia/Shanghai local time)
-        env:
-          INPUT_REPORT: ${{ github.event.inputs.report_type }}
+      - name: Determine DR URL and report type
+        id: decide
         run: |
-          set -e
-          echo "Manual input report_type: '$INPUT_REPORT'"
+          # Inputs may override secrets for manual runs
+          INPUT_REPORT="${{ github.event.inputs.report_type }}"
+          INPUT_DR_URL="${{ github.event.inputs.dr_stock_scanner_url }}"
+          SECRET_DR_URL="${DR_STOCK_SCANNER_URL}"
 
-          # Prefer manual override when provided
+          if [ -n "$INPUT_DR_URL" ]; then
+            DR_URL="$INPUT_DR_URL"
+          else
+            DR_URL="$SECRET_DR_URL"
+          fi
+
+          if [ -z "$DR_URL" ]; then
+            echo "DR_URL_NOT_SET=true" >> $GITHUB_OUTPUT
+            echo "DR_URL_VALUE=" >> $GITHUB_OUTPUT
+          else
+            echo "DR_URL_NOT_SET=false" >> $GITHUB_OUTPUT
+            echo "DR_URL_VALUE=$DR_URL" >> $GITHUB_OUTPUT
+          fi
+
+          # Determine report_type: manual input wins; otherwise infer from Asia/Shanghai time
           if [ -n "$INPUT_REPORT" ]; then
             REPORT_TYPE="$INPUT_REPORT"
-            echo "Using manual REPORT_TYPE=$REPORT_TYPE"
           else
-            # Compute Asia/Shanghai local time and derive report type
             now=$(TZ=Asia/Shanghai date +'%H:%M')
-            echo "Asia/Shanghai local time: $now"
             if [ "$now" = "08:00" ]; then
               REPORT_TYPE="morning_brief"
             elif [ "$now" = "12:00" ]; then
@@ -87,25 +99,66 @@ jobs:
             elif [ "$now" = "16:30" ]; then
               REPORT_TYPE="eod_summary"
             else
-              echo "Triggered at unexpected local time ($now) and no manual report_type provided — exiting without sending."
-              exit 0
+              # If scheduled run fired at an off time (rare), choose nearest mapping by hour
+              hour=$(TZ=Asia/Shanghai date +'%H')
+              if [ "$hour" -lt 10 ]; then
+                REPORT_TYPE="morning_brief"
+              elif [ "$hour" -lt 15 ]; then
+                REPORT_TYPE="midday_review"
+              else
+                REPORT_TYPE="eod_summary"
+              fi
             fi
-            echo "Selected REPORT_TYPE based on schedule: $REPORT_TYPE"
           fi
+          echo "report_type=$REPORT_TYPE" >> $GITHUB_OUTPUT
+          echo "Using DR_URL=$DR_URL"
+      - name: Fail early if DR_STOCK_SCANNER_URL not configured
+        if: steps.decide.outputs.DR_URL_NOT_SET == 'true'
+        run: |
+          echo "::error::DR_STOCK_SCANNER_URL is not set. For GitHub-hosted runner the DR service must be reachable from the internet."
+          echo "Set repository secret DR_STOCK_SCANNER_URL to your public/tunnel URL (e.g. https://your-host:5000) and re-run."
+          exit 1
 
-          # Show Python version and basic env
-          python --version
-          echo "Using SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_KEY:+(set)}"
-          echo "Using DR_FLASK_HOST=$DR_FLASK_HOST DR_FLASK_PORT=$DR_FLASK_PORT"
-
-          # Run the email_system script (ensure filename/path is correct)
-          if [ ! -f "./email_system.py" ]; then
-            echo "错误：找不到 email_system.py，请确保文件在仓库根目录或调整路径"
+      - name: Verify DR service health
+        run: |
+          DR_URL="${{ steps.decide.outputs.DR_URL_VALUE }}"
+          echo "Checking DR service at $DR_URL"
+          # prefer /api/status then /api/system_info then root
+          set -e
+          HEALTH_OK=1
+          for path in "/api/status" "/api/system_info" "/"; do
+            url="${DR_URL%/}${path}"
+            echo "Trying $url"
+            if curl -s -f -m 10 "$url" >/dev/null 2>&1; then
+              echo "OK: $url"
+              HEALTH_OK=0
+              break
+            else
+              echo "No response: $url"
+            fi
+          done
+          if [ $HEALTH_OK -ne 0 ]; then
+            echo "::error::DR service at $DR_URL is not reachable or returned non-200 for health endpoints."
             exit 1
           fi
 
-          # Run the program with the selected report type
-          # The script will instantiate WebStockAnalyzer and (optionally) start Flask in background,
-          # then analyze users' watchlists and send emails.
+      - name: Run email_system.py
+        env:
+          # inject determined DR URL and secrets to the script env
+          DR_STOCK_SCANNER_URL: ${{ steps.decide.outputs.DR_URL_VALUE }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          FROM_NAME: ${{ secrets.FROM_NAME }}
+        run: |
+          REPORT_TYPE="${{ steps.decide.outputs.report_type }}"
+          echo "Running email_system.py with report_type=$REPORT_TYPE"
+          if [ ! -f "./email_system.py" ]; then
+            echo "::error::Cannot find email_system.py at repo root. Please ensure the script is present."
+            exit 1
+          fi
           python email_system.py "$REPORT_TYPE"
         working-directory: ${{ github.workspace }}
